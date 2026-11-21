@@ -24,6 +24,7 @@ class ClientCfg:
     local_iters: int = 15      # new trees per round (t > 1)
     mlp_epochs: int = 2
     mlp_lr: float = 1e-3
+    mlp_pos_weight: float | None = None  # FL-safe global sqrt(neg/pos) weight
     prox_mu: float = 0.0       # >0 enables FedProx
     mlp_agg: str = "fedavg"    # fedavg | fedprox | fedbn
     seed: int = 42
@@ -196,7 +197,8 @@ class FraudClient:
             if len(self.y["train"]) >= 2:
                 model = M.train_mlp(model, self.X["train"], self.y["train"],
                                     epochs=cfg.mlp_epochs, lr=cfg.mlp_lr, prox_mu=mu,
-                                    ref_arrays=ref, seed=cfg.seed + server_round)
+                                    ref_arrays=ref, seed=cfg.seed + server_round,
+                                    pos_weight=cfg.mlp_pos_weight)
             arrays = M.mlp_to_arrays(model)
             if cfg.mlp_agg == "fedbn":
                 self.local_bn = {i: arrays[i].copy() for i in M.bn_indices(self.keys)}
@@ -206,13 +208,21 @@ class FraudClient:
 
         raise ValueError(self.model_type)
 
+    def _mlp_logit_shift(self) -> float:
+        if self.cfg.mlp_pos_weight is not None:
+            pw = max(float(self.cfg.mlp_pos_weight), 1.0)
+        else:
+            y_tr = self.y["train"]
+            pw = M.compute_mlp_pos_weight(float(y_tr.sum()), float(len(y_tr))) if len(y_tr) else 1.0
+        return float(np.log(pw))
+
     def predict(self, payload, split="val", bn_round: int | None = None):
         if self.model_type == "xgboost":
             return M.xgb_predict(payload, self.X[split])
         if self.model_type == "catboost":
             return M.cat_predict(payload, self.X[split])
         model = self._mlp_model_from(payload, bn_round=bn_round)
-        return M.mlp_predict(model, self.X[split])
+        return M.mlp_predict(model, self.X[split], logit_shift=self._mlp_logit_shift())
 
     def evaluate(self, payload, server_round: int | None = None):
         y_val = self.y["val"]

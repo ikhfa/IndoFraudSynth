@@ -451,3 +451,34 @@ def test_federated_early_stopping_patience():
                                    budget=None, patience=1, verbose=False)
     assert info_fl["stopped_early"] is True
     assert len(info_fl["rounds"]) < 6
+    assert info_loc["final_round"] == len(info_loc["rounds"])
+    assert info_fl["final_round"] == len(info_fl["rounds"])
+    assert np.isfinite(info_loc["final_val_ap"]) and np.isfinite(info_fl["final_val_ap"])
+
+
+def test_mlp_prior_correction_and_xgb_predict_fast():
+    """Verify analytical pos_weight logit shift improves MLP probability calibration
+    and xgb_predict_fast matches xgb_predict_loaded."""
+    import torch
+    from fl_experiments.metrics import ece
+
+    rng = np.random.default_rng(42)
+    n = 3000
+    X = rng.normal(size=(n, 6)).astype(np.float32)
+    logits = 2.0 * X[:, 0] + 1.5 * X[:, 1] - 5.5
+    probs = 1.0 / (1.0 + np.exp(-logits))
+    y = (rng.random(n) < probs).astype(np.int8)
+    assert 10 <= y.sum() <= 150
+
+    torch.manual_seed(0)
+    mlp = M.make_mlp(6)
+    mlp = M.train_mlp(mlp, X, y, epochs=8, lr=3e-3, seed=0)
+    assert getattr(mlp, "prior_logit_shift_", 0.0) > 1.0
+    p_corr = M.mlp_predict(mlp, X)
+    p_raw = M.mlp_predict(mlp, X, logit_shift=0.0)
+    # Analytical prior correction must substantially reduce ECE on imbalanced data
+    assert ece(y, p_corr) < ece(y, p_raw)
+
+    bst = M.train_xgb(X, y, 15, seed=0)
+    assert np.allclose(M.xgb_predict_fast(bst, X[:50]),
+                       M.xgb_predict_loaded(bst, X[:50]), atol=1e-5)

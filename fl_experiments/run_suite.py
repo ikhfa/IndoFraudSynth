@@ -24,6 +24,8 @@ from .stats import load_suite_dir, analyze_runs
 
 CONDITION_PRESETS: dict[str, list[str]] = {
     "baseline": ["--tree-agg", "baseline", "--mlp-agg", "fedavg"],
+    "normalized_unbudgeted": ["--tree-agg", "normalized", "--tree-weight", "uniform",
+                              "--tree-budget", "0", "--mlp-agg", "fedavg"],
     "normalized": ["--tree-agg", "normalized", "--tree-weight", "uniform", "--mlp-agg", "fedavg"],
     "normalized_fedprox": ["--tree-agg", "normalized", "--tree-weight", "uniform", "--mlp-agg", "fedprox"],
     "normalized_fedbn": ["--tree-agg", "normalized", "--tree-weight", "uniform", "--mlp-agg", "fedbn"],
@@ -106,6 +108,19 @@ def main():
         part_dir = os.path.join(args.out, ptag)
         os.makedirs(part_dir, exist_ok=True)
         for seed in seeds:
+            has_baselines_for_seed = False
+            if args.skip_existing:
+                import json
+                for prev_cond in conditions:
+                    prev_path = os.path.join(part_dir, prev_cond, f"seed_{seed}", "results.json")
+                    if os.path.exists(prev_path):
+                        try:
+                            with open(prev_path) as f:
+                                if "baselines" in json.load(f):
+                                    has_baselines_for_seed = True
+                                    break
+                        except Exception:
+                            pass
             for c_idx, cond in enumerate(conditions):
                 run_dir = os.path.join(part_dir, cond, f"seed_{seed}")
                 res_path = os.path.join(run_dir, "results.json")
@@ -113,11 +128,14 @@ def main():
                     print(f"[skip] {res_path}")
                     continue
                 # Compute centralized + local-only baselines once per (partition, seed)
+                need_base = not has_baselines_for_seed
                 cmd = build_run_cmd(args, pmode, palpha, cond, seed, run_dir,
-                                    run_baselines=(c_idx == 0))
+                                    run_baselines=need_base)
                 print("[run]", " ".join(cmd))
                 if not args.dry_run:
                     subprocess.run(cmd, check=True)
+                    if need_base:
+                        has_baselines_for_seed = True
 
         if not args.dry_run:
             runs = load_suite_dir(part_dir)

@@ -119,7 +119,10 @@ def run_local_engine(cores, model_type, rounds, normalize, budget,
     if model_type == "mlp" and best_round > 0:
         for c in cores:
             c.restore_bn_round(best_round)
+    final_round = logs[-1]["round"] if logs else 0
+    final_val_ap = logs[-1]["macro_val_ap"] if logs else float("nan")
     return best_payload, {"best_round": best_round, "best_val_ap": best_ap,
+                          "final_round": final_round, "final_val_ap": final_val_ap,
                           "stopped_early": stopped_early,
                           "rounds": logs, "upload_bytes": up_bytes,
                           "broadcast_bytes": down_bytes}
@@ -212,6 +215,7 @@ def run_flower_engine(cores, model_type, rounds, normalize, budget,
             c.restore_bn_round(strategy.best_round)
 
     info = {"best_round": strategy.best_round, "best_val_ap": strategy.best_ap,
+            "final_round": strategy.final_round, "final_val_ap": strategy.final_val_ap,
             "stopped_early": strategy.stopped_early,
             "rounds": strategy.round_logs,
             "upload_bytes": strategy.total_client_bytes,
@@ -343,7 +347,7 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     model_types = [m.strip() for m in args.models.split(",")]
     normalize = args.tree_agg == "normalized"
-    budget = args.tree_budget if normalize else None
+    budget = args.tree_budget if (normalize and args.tree_budget and args.tree_budget > 0) else None
 
     print(f"Loading {args.data} ({args.dataset}) ...")
     loaders = {
@@ -363,21 +367,25 @@ def main():
                                       args.seed, args.train_cap)
     print(f"Clients: { {k: len(v['train']) for k, v in clients_df.items()} }")
 
-    # FL-safe global MLP standardization from per-client sufficient statistics
-    # (count, sum, sum_sq) so all clients share one feature coordinate scale.
+    # FL-safe global MLP standardization & pos_weight from per-client scalar sufficient
+    # statistics ((count, sum, sum_sq) and (n_pos, n_total)) — zero raw rows shared.
     fed_pre = None
+    fed_mlp_pw = None
     if "mlp" in model_types:
         stats = [MLPPreprocessor.local_stats(build_matrix(fr["train"], args.dataset)[0])
                  for fr in clients_df.values()]
         fed_pre = MLPPreprocessor().fit_from_stats(stats)
+        tot_pos = sum(int(fr["train"].is_fraud.sum()) for fr in clients_df.values())
+        tot_n = sum(len(fr["train"]) for fr in clients_df.values())
+        fed_mlp_pw = M.compute_mlp_pos_weight(tot_pos, tot_n)
 
     bn_dir = (os.path.join(args.out, "_bn_state")
               if (args.mlp_agg == "fedbn" and args.engine == "flower") else None)
     if bn_dir and os.path.isdir(bn_dir):
         shutil.rmtree(bn_dir, ignore_errors=True)
     ccfg = ClientCfg(t0=args.t0, local_iters=args.local_iters, mlp_epochs=args.mlp_epochs,
-                     prox_mu=args.prox_mu, mlp_agg=args.mlp_agg, seed=args.seed,
-                     dataset=args.dataset, bn_state_dir=bn_dir)
+                     mlp_pos_weight=fed_mlp_pw, prox_mu=args.prox_mu, mlp_agg=args.mlp_agg,
+                     seed=args.seed, dataset=args.dataset, bn_state_dir=bn_dir)
     cores = {mt: [FraudClient(name, mt, frames, ccfg,
                               pre=(fed_pre if mt == "mlp" else None))
                   for name, frames in clients_df.items()] for mt in model_types}
@@ -431,7 +439,7 @@ def main():
     if "xgboost" in payloads and payloads["xgboost"] is not None:
         c0 = cores["xgboost"][0]
         bst_loaded = M.bytes_to_xgb(payloads["xgboost"])
-        xgb_fn = lambda X, _b=bst_loaded: M.xgb_predict_loaded(_b, X)
+        xgb_fn = lambda X, _b=bst_loaded: M.xgb_predict_fast(_b, X)
         lat["xgboost"] = latency_p95_ms(xgb_fn, c0.X["test"], n_iter=200, warmup=15)
         loaded_predictors.append((xgb_fn, c0.X["test"]))
     if "catboost" in payloads and payloads["catboost"] is not None:
@@ -443,7 +451,8 @@ def main():
     if "mlp" in payloads and payloads["mlp"] is not None:
         c0 = cores["mlp"][0]
         mlp_loaded = c0._mlp_model_from(payloads["mlp"]).eval()
-        mlp_fn = lambda X, _m=mlp_loaded: M.mlp_predict(_m, X)
+        mlp_shift = c0._mlp_logit_shift()
+        mlp_fn = lambda X, _m=mlp_loaded, _s=mlp_shift: M.mlp_predict(_m, X, logit_shift=_s)
         lat["mlp"] = latency_p95_ms(mlp_fn, c0.X["test"], n_iter=200, warmup=15)
         loaded_predictors.append((mlp_fn, c0.X["test"]))
     if len(loaded_predictors) >= 2:

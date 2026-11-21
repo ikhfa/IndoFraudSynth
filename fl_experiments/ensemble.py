@@ -37,6 +37,13 @@ class PlattCalibrator:
         self.slope_: float = 1.0
         self.intercept_: float = 0.0
 
+    @classmethod
+    def from_params(cls, slope: float, intercept: float, reg: float = 0.1) -> "PlattCalibrator":
+        obj = cls(reg=reg)
+        obj.slope_ = max(float(slope), 1e-3)
+        obj.intercept_ = float(intercept)
+        return obj
+
     @staticmethod
     def _to_logit(s: np.ndarray) -> np.ndarray:
         p = np.clip(np.asarray(s, dtype=np.float64), 1e-15, 1.0 - 1e-15)
@@ -50,11 +57,11 @@ class PlattCalibrator:
         def _obj_and_grad(params):
             a, b = float(params[0]), float(params[1])
             m = a * z + b
-            # Overflow-safe binary cross-entropy + mild L2 penalty on slope
-            loss = float(np.sum(np.logaddexp(0.0, m) - yf * m) + 0.5 * reg * (a * a))
+            # Overflow-safe binary cross-entropy + mild L2 penalty toward identity slope a=1
+            loss = float(np.sum(np.logaddexp(0.0, m) - yf * m) + 0.5 * reg * ((a - 1.0) ** 2))
             diff = expit(m) - yf
             grad = np.array([
-                float(np.dot(diff, z) + reg * a),
+                float(np.dot(diff, z) + reg * (a - 1.0)),
                 float(np.sum(diff)),
             ], dtype=np.float64)
             return loss, grad
@@ -85,6 +92,40 @@ def _make_calibrator(y: np.ndarray):
     if pos >= 5 and neg >= 5:
         return PlattCalibrator(), "platt"
     return None, "identity"
+
+
+def _build_calibrator(kind: str):
+    if kind == "isotonic":
+        return IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    if kind == "platt":
+        return PlattCalibrator()
+    return None
+
+
+def _agg_platt_params(platt_params: dict[str, tuple[float, float, int]],
+                      exclude: str | None = None) -> tuple[float, float] | None:
+    """FL-safe positive-count-weighted average of local Platt (slope, intercept) scalars."""
+    items = [(a, b, w) for s, (a, b, w) in platt_params.items() if s != exclude and w > 0]
+    if not items:
+        return None
+    tot_w = float(sum(w for _, _, w in items))
+    a_g = sum(a * w for a, _, w in items) / tot_w
+    b_g = sum(b * w for _, b, w in items) / tot_w
+    return float(a_g), float(b_g)
+
+
+def _shrink_platt(cal: PlattCalibrator, global_ab: tuple[float, float] | None,
+                  pos: int, prior_strength: float = 15.0) -> PlattCalibrator:
+    """Empirical-Bayes shrinkage of a small-silo Platt fit toward federated global (a, b)."""
+    if global_ab is None or pos >= 50:
+        return cal
+    gamma = float(pos) / (float(pos) + float(prior_strength))
+    a_g, b_g = global_ab
+    return PlattCalibrator.from_params(
+        gamma * cal.slope_ + (1.0 - gamma) * a_g,
+        gamma * cal.intercept_ + (1.0 - gamma) * b_g,
+        reg=cal.reg,
+    )
 
 
 def gather_scores(clients, payloads, split):
@@ -139,42 +180,94 @@ def search_weights(val_scores, y_vals, n_draws=300, seed=42):
     return {m: float(w) for m, w in zip(models, best_w)}, float(best_v)
 
 
-def fit_calibrators(val_scores, y_vals, seed: int = 42):
-    """Per-silo calibration (Platt for 5..49 positives, Isotonic for >= 50).
+def fit_calibrators(val_scores, y_vals, seed: int = 42, prior_strength: float = 15.0):
+    """Per-silo calibration with FL-safe hierarchical Platt shrinkage & global fallback.
 
-    Returns `(cals, methods, oof_scores)` where `oof_scores` are strictly
-    out-of-fold calibrated validation scores (preventing overfitting during
-    subsequent ensemble weight and threshold optimization).
+    - Silos with >=50 positives use Isotonic regression (locking the same family in OOF).
+    - Silos with 5..49 positives use Platt scaling; when multiple silos exist, local
+      `(a_k, b_k)` parameters are shrunk toward the FL-safe global Platt average
+      `(a_global, b_global)` (only 2 scalars + positive count shared per silo).
+    - Silos with <5 positives fall back to the federated global Platt calibrator
+      (`platt_global`) instead of raw uncalibrated scores, preventing cross-silo
+      score-scale mismatches in pooled evaluation and Bayes decisions.
+
+    Returns `(cals, methods, oof_scores)` where `oof_scores` are strictly out-of-fold
+    (and leave-one-silo-out for the global shrinkage target) to avoid overfitting `val`.
     """
     cals, methods, oof = {}, {}, {}
     for m, by_silo in val_scores.items():
         cals[m] = {}; methods[m] = {}; oof[m] = {}
+        # Pass 1: fit local Platt scalars on every silo with >=5 positives to build
+        # the FL-safe global fallback/shrinkage target (2 floats + 1 int per silo).
+        local_platt: dict[str, tuple[float, float, int]] = {}
+        raw_local: dict[str, tuple[object | None, str, np.ndarray, np.ndarray, int]] = {}
         for s, scores in by_silo.items():
             y = np.asarray(y_vals[s], dtype=int)
-            scores = np.asarray(scores, dtype=np.float64)
-            cal, kind = _make_calibrator(y)
-            methods[m][s] = kind
-            if cal is None:
-                cals[m][s] = None
-                oof[m][s] = scores.copy()
-                continue
-            cal.fit(scores, y)
-            cals[m][s] = cal
+            sc = np.asarray(scores, dtype=np.float64)
             pos = int(y.sum())
+            neg = int(len(y) - pos)
+            cal, kind = _make_calibrator(y)
+            if cal is not None:
+                cal.fit(sc, y)
+                if kind == "platt":
+                    local_platt[s] = (cal.slope_, cal.intercept_, pos)
+                else:
+                    # Also fit a lightweight 2-param Platt strictly for global fallback sharing
+                    p_share = PlattCalibrator().fit(sc, y)
+                    local_platt[s] = (p_share.slope_, p_share.intercept_, pos)
+            raw_local[s] = (cal, kind, sc, y, pos)
+
+        global_ab = _agg_platt_params(local_platt, exclude=None) if len(by_silo) >= 2 else None
+
+        # Pass 2: assemble final per-silo calibrators and strictly leak-free OOF predictions
+        for s, (cal, kind, sc, y, pos) in raw_local.items():
+            other_ab = _agg_platt_params(local_platt, exclude=s) if len(by_silo) >= 2 else None
+
+            if cal is None:
+                # Low-positive silo (<5 positives): use FL-safe global Platt fallback
+                if global_ab is not None:
+                    gcal = PlattCalibrator.from_params(global_ab[0], global_ab[1])
+                    cals[m][s] = gcal
+                    methods[m][s] = "platt_global"
+                    oof[m][s] = gcal.predict(sc)
+                else:
+                    cals[m][s] = None
+                    methods[m][s] = "identity"
+                    oof[m][s] = sc.copy()
+                continue
+
+            if kind == "platt" and other_ab is not None:
+                final_cal = _shrink_platt(cal, other_ab, pos, prior_strength=prior_strength)
+                cals[m][s] = final_cal
+                methods[m][s] = "platt_shrunk"
+            else:
+                final_cal = cal
+                cals[m][s] = final_cal
+                methods[m][s] = kind
+
             n_splits = min(3, pos, int(len(y) - pos))
             if n_splits >= 2:
                 skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-                pred = np.empty_like(scores, dtype=np.float64)
-                for tr, va in skf.split(scores.reshape(-1, 1), y):
-                    fcal, _ = _make_calibrator(y[tr])
-                    if fcal is None:
-                        pred[va] = scores[va]
+                pred = np.empty_like(sc, dtype=np.float64)
+                for tr, va in skf.split(sc.reshape(-1, 1), y):
+                    pos_tr = int(y[tr].sum())
+                    neg_tr = int(len(y[tr]) - pos_tr)
+                    # Lock inner OOF calibrator family to outer `kind` (prevents silent
+                    # identity fallback when pos in {5,6,7} or family flip at pos in {50..74})
+                    if pos_tr >= 2 and neg_tr >= 2:
+                        fcal = _build_calibrator(kind)
+                        fcal.fit(sc[tr], y[tr])
+                        if kind == "platt" and other_ab is not None:
+                            fcal = _shrink_platt(fcal, other_ab, pos_tr,
+                                                 prior_strength=prior_strength)
+                        pred[va] = fcal.predict(sc[va])
+                    elif other_ab is not None:
+                        pred[va] = PlattCalibrator.from_params(other_ab[0], other_ab[1]).predict(sc[va])
                     else:
-                        fcal.fit(scores[tr], y[tr])
-                        pred[va] = fcal.predict(scores[va])
+                        pred[va] = sc[va]
                 oof[m][s] = pred
             else:
-                oof[m][s] = cal.predict(scores)
+                oof[m][s] = final_cal.predict(sc)
     return cals, methods, oof
 
 
@@ -286,10 +379,21 @@ def evaluate_ensemble(clients, payloads, c_fp=7500.0, seed=42, n_draws=300,
     global_thr_variant(soft_val, soft_test, "soft_voting")
     global_thr_variant(w_val, w_test, "weighted_voting")
 
-    # PROPOSED (a): per-silo calibration + per-silo cost-optimal flat thresholds (strictly local)
-    thr_map = {}
-    for s in ref_clients:
-        thr_map[s], _ = cost_threshold(y_vals[s], cal_val[s], ref_clients[s].amt["val"], c_fp)
+    # PROPOSED (a): per-silo calibration + per-silo cost-optimal flat thresholds (strictly local;
+    # zero-positive val silos fall back to the FL-safe median threshold of positive silos)
+    def _per_silo_thresholds(val_comb):
+        raw_t = {}
+        pos_thrs = []
+        for s in ref_clients:
+            t, _ = cost_threshold(y_vals[s], val_comb[s], ref_clients[s].amt["val"], c_fp)
+            raw_t[s] = t
+            if int(np.asarray(y_vals[s]).sum()) > 0:
+                pos_thrs.append(t)
+        med_t = float(np.median(pos_thrs)) if pos_thrs else 0.5
+        return {s: (raw_t[s] if int(np.asarray(y_vals[s]).sum()) > 0 else med_t)
+                for s in ref_clients}
+
+    thr_map = _per_silo_thresholds(cal_val)
     variants["weighted_calibrated_per_silo"] = _eval_variant(cal_test, ref_clients, thr_map, c_fp)
 
     # PROPOSED (b): per-silo calibration + Bayes minimum-risk rule (p_i * A_i >= c_fp)
@@ -311,10 +415,7 @@ def evaluate_ensemble(clients, payloads, c_fp=7500.0, seed=42, n_draws=300,
             sub_w, sub_obj = search_weights(sub_oof, y_vals, n_draws, seed)
             sub_val = {s: sum(sub_w[m] * cal_val_oof[m][s] for m in pair) for s in ref_clients}
             sub_test = {s: sum(sub_w[m] * cal_test_by_m[m][s] for m in pair) for s in ref_clients}
-            sub_thr = {
-                s: cost_threshold(y_vals[s], sub_val[s], ref_clients[s].amt["val"], c_fp)[0]
-                for s in ref_clients
-            }
+            sub_thr = _per_silo_thresholds(sub_val)
             key = "+".join(pair)
             ablations_2model[key] = {
                 "weights": sub_w,

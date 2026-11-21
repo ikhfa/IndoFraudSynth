@@ -68,6 +68,14 @@ def xgb_predict_loaded(bst, X) -> np.ndarray:
     return bst.predict(xgb.DMatrix(X))
 
 
+def xgb_predict_fast(bst, X) -> np.ndarray:
+    """Low-overhead in-memory inference avoiding per-call DMatrix allocation."""
+    try:
+        return np.asarray(bst.inplace_predict(np.asarray(X, dtype=np.float32)), dtype=np.float64)
+    except Exception:
+        return xgb_predict_loaded(bst, X)
+
+
 def xgb_predict(payload: bytes, X) -> np.ndarray:
     return xgb_predict_loaded(bytes_to_xgb(payload), X)
 
@@ -175,8 +183,15 @@ def mlp_from_arrays(model, arrays):
     return model
 
 
+def compute_mlp_pos_weight(pos: float, total: float) -> float:
+    """Mild sqrt inverse-frequency positive class weight (>= 1.0)."""
+    neg = max(float(total) - float(pos), 0.0)
+    return float(max(neg / max(float(pos), 1.0), 1.0) ** 0.5)
+
+
 def train_mlp(model, X, y, epochs=2, lr=1e-3, batch_size=1024, prox_mu=0.0,
-              ref_arrays=None, seed=42, eval_set=None, patience=None):
+              ref_arrays=None, seed=42, eval_set=None, patience=None,
+              pos_weight: float | None = None):
     import torch
     from .metrics import ap as _ap
     torch.manual_seed(seed)
@@ -184,9 +199,13 @@ def train_mlp(model, X, y, epochs=2, lr=1e-3, batch_size=1024, prox_mu=0.0,
     model = model.to(device).train()
     Xt = torch.as_tensor(np.array(X, dtype=np.float32, copy=True))
     yt = torch.as_tensor(np.array(y, dtype=np.float32, copy=True))
-    pos = float(yt.sum()); neg = float(len(yt) - pos)
-    pos_weight = torch.tensor(max(neg / max(pos, 1.0), 1.0) ** 0.5)  # mild sqrt reweight
-    loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    if pos_weight is None:
+        pw_val = compute_mlp_pos_weight(float(yt.sum()), float(len(yt)))
+    else:
+        pw_val = max(float(pos_weight), 1.0)
+    pos_weight_t = torch.tensor(pw_val, dtype=torch.float32)
+    loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight_t)
+    prior_shift = float(np.log(pw_val))
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     # Map reference arrays by state_dict key so BatchNorm buffers never misalign
     # with model.named_parameters() (fixes silent skipping of fc2/fc3 in FedProx).
@@ -225,7 +244,7 @@ def train_mlp(model, X, y, epochs=2, lr=1e-3, batch_size=1024, prox_mu=0.0,
             loss.backward()
             opt.step()
         if use_es:
-            val_score = _ap(yva_arr, mlp_predict(model, Xva))
+            val_score = _ap(yva_arr, mlp_predict(model, Xva, logit_shift=prior_shift))
             if not np.isnan(val_score) and val_score > best_ap:
                 best_ap = val_score
                 best_arrays = mlp_to_arrays(model)
@@ -238,15 +257,23 @@ def train_mlp(model, X, y, epochs=2, lr=1e-3, batch_size=1024, prox_mu=0.0,
     if use_es and best_arrays is not None:
         mlp_from_arrays(model, best_arrays)
     model.best_epoch_ = best_epoch
+    model.prior_logit_shift_ = prior_shift
     return model
 
 
-def mlp_predict(model, X, batch_size=4096):
+def mlp_predict(model, X, batch_size=4096, logit_shift: float | None = None):
+    """Predict fraud probabilities, analytically correcting for training `pos_weight`
+    logit shift (`z_corr = z - log(pos_weight)`) so outputs sit on the true posterior scale."""
     import torch
     model = model.eval()
+    shift = (float(logit_shift) if logit_shift is not None
+             else float(getattr(model, "prior_logit_shift_", 0.0)))
     outs = []
     with torch.no_grad():
         Xt = torch.as_tensor(X, dtype=torch.float32)
         for i in range(0, len(Xt), batch_size):
-            outs.append(torch.sigmoid(model(Xt[i:i + batch_size])).numpy())
+            logits = model(Xt[i:i + batch_size])
+            if shift != 0.0:
+                logits = logits - shift
+            outs.append(torch.sigmoid(logits).numpy())
     return np.concatenate(outs) if outs else np.zeros(0)

@@ -168,10 +168,11 @@ def load_sparkov(path: str) -> pd.DataFrame:
         )
 
     df["silo_id"] = 0
-    # Drop raw PII / high-cardinality identifiers that must never enter features.
+    # Drop raw PII / high-cardinality identifiers (and arbitrary postal code `zip`,
+    # since `lat`/`long`/`geo_dist_km`/`city_pop_log` capture geography cleanly).
     pii_drop = [
         "Unnamed: 0", "trans_date_trans_time", "cc_num", "merchant",
-        "first", "last", "street", "city", "trans_num", "dob", "unix_time",
+        "first", "last", "street", "city", "zip", "trans_num", "dob", "unix_time",
     ]
     df = df.drop(columns=[c for c in pii_drop if c in df.columns])
 

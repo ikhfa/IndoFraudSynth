@@ -366,7 +366,8 @@ def extract_cat_delta(full_payload: bytes, n_prev: int) -> bytes:
 def cat_num_trees(payload: bytes) -> int:
     if not payload:
         return 0
-    return len(_cat_native_to_json(payload).get("oblivious_trees", []))
+    from .models import bytes_to_cat
+    return int(bytes_to_cat(payload).tree_count_)
 
 
 def merge_cat(client_payloads, global_payload=None, normalize=False, n_prev=0,

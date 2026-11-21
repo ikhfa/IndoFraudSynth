@@ -131,7 +131,7 @@ An **open-source, calibrated synthetic generator** of Indonesian multi-rail paym
   3. **Mule fan-out networks:** first-party/mule accounts receiving and rapidly dispersing funds (gambling/scam laundering; PPATK-documented patterns);
   4. **Merchant-side QRIS abuse:** static-QR tampering (quishing), fake merchants, refund abuse.
 - **Calibration targets (aggregate-level, all public):** rail volumes/tickets (BI), scam-report and blocked-account counts (OJK/IASC), typology shares (Satgas PASTI modus list), fraud rate per rail set to a plausible 0.05–1% range with sensitivity analysis. **Document every calibration constant and its source in the repo** — this is your defense against "synthetic data is arbitrary."
-- **Silo partitioning:** institutions as silos with profiles — 2 large banks, 2 mid banks/BPD, 3 e-wallets, 1–2 P2P/fintech → natural quantity skew (e.g., 40/25/15/8/5/3/2/1/0.7/0.3%), rail-specific feature schemas, per-silo fraud priors. Also provide Dirichlet(α) partitions (α ∈ {0.1, 0.5, 5, ∞}) for controlled skew experiments.
+- **Silo partitioning:** institutions as silos with profiles — 2 large banks, 2 mid banks/BPD, 3 e-wallets, 1–2 P2P/fintech → natural quantity skew (e.g., 40/25/15/8/5/3/2/1/0.7/0.3%), standardized canonical feature schema with rail-mix / feature-support skew, per-silo fraud priors. Also provide Dirichlet(α) partitions (α ∈ {0.1, 0.5, 5, ∞}) for controlled skew experiments.
 - **Splits:** chronological train/val/test (e.g., 12 months: 7/2/3) with a fraud-campaign drift between periods.
 - **Release:** GitHub + Zenodo DOI (citable artifact), dataset card, generator seed control. This alone strengthens any S2 submission and enables a later data-descriptor paper.
 

@@ -20,6 +20,8 @@ class _BestTracker:
         self.best_ap = -1.0
         self.best_payload = None
         self.best_round = 0
+        self.final_round = 0
+        self.final_val_ap = 0.0
         self.patience = int(patience or 0)
         self.stale_rounds = 0
         self.stopped_early = False
@@ -37,9 +39,14 @@ class _BestTracker:
         }
 
     def note_eval(self, server_round, results, payload):
+        # Sort by client cid so per_client_ap ordering is deterministic under Ray
+        ordered = sorted(
+            results,
+            key=lambda item: (int(item[0].cid) if str(item[0].cid).isdigit() else str(item[0].cid)),
+        )
         aps = []
         valid_aps = []
-        for _, res in results:
+        for _, res in ordered:
             a = float(res.metrics.get("ap", 0.0))
             has_pos = float(res.metrics.get("has_pos", 1.0)) > 0.5
             if has_pos and np.isfinite(a) and a >= 0.0:
@@ -48,6 +55,8 @@ class _BestTracker:
             else:
                 aps.append(None)
         macro = float(np.mean(valid_aps)) if valid_aps else 0.0
+        self.final_round = server_round
+        self.final_val_ap = macro
         if macro > self.best_ap:
             self.best_ap = macro
             self.best_payload = ([a.copy() for a in payload]
@@ -62,8 +71,8 @@ class _BestTracker:
         entry["macro_val_ap"] = macro
         entry["per_client_ap"] = aps
         self.round_logs.append(entry)
-        losses = [float(res.loss) for _, res in results]
-        ns = [int(res.num_examples) for _, res in results]
+        losses = [float(res.loss) for _, res in ordered]
+        ns = [int(res.num_examples) for _, res in ordered]
         agg_loss = float(np.average(losses, weights=ns)) if sum(ns) > 0 else 0.0
         return agg_loss, {"macro_val_ap": macro, "best_val_ap": self.best_ap}
 

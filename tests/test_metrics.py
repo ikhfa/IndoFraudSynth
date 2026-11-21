@@ -89,3 +89,38 @@ def test_default_c_fp_and_operational_alert_budget():
     assert alert_rate(capped) <= 0.01
     assert fpr_flags(y, capped) == 0.0
     assert bayes_savings(y, p, amt, c_fp=7500.0, max_alert_rate=0.01) == 1.0
+
+
+def test_hierarchical_platt_global_fallback_and_oof_consistency():
+    """Regression test:
+    1. Silos with 5..7 positives must NOT fall back to uncalibrated identity inside 3-fold OOF.
+    2. Tiny silos (<5 positives) must receive FL-safe `platt_global` fallback so pooled
+       scores across silos stay on one calibrated scale (preventing the PR cliff).
+    """
+    rng = np.random.default_rng(7)
+    # Silo A: 20 positives, compressed unnormalized scores (~1e-12)
+    ya = np.array([0] * 1000 + [1] * 20)
+    sa = np.concatenate([rng.uniform(1e-14, 1e-12, 1000), rng.uniform(5e-12, 5e-11, 20)])
+    # Silo B: 6 positives (edge case where 3-fold y[tr] has only 4 positives!)
+    yb = np.array([0] * 500 + [1] * 6)
+    sb = np.concatenate([rng.uniform(1e-14, 1e-12, 500), rng.uniform(5e-12, 5e-11, 6)])
+    # Silo C: 2 positives (<5 threshold -> previously raw identity!)
+    yc = np.array([0] * 400 + [1] * 2)
+    sc = np.concatenate([rng.uniform(1e-14, 1e-12, 400), rng.uniform(5e-12, 5e-11, 2)])
+
+    cals, methods, oof = fit_calibrators(
+        {"xgb": {"sA": sa, "sB": sb, "sC": sc}},
+        {"sA": ya, "sB": yb, "sC": yc},
+        seed=42,
+    )
+    assert methods["xgb"]["sA"] == "platt_shrunk"
+    assert methods["xgb"]["sB"] == "platt_shrunk"
+    assert methods["xgb"]["sC"] == "platt_global"
+    assert cals["xgb"]["sC"] is not None
+    # Silo B OOF must be on calibrated probability scale (~0.01), NOT raw 1e-12!
+    assert oof["xgb"]["sB"].max() > 0.05
+    # Pooled calibrated predictions across all 3 silos (incl. tiny sC) must preserve high AP
+    p_all = np.concatenate([cals["xgb"][k].predict(s) for k, s in [("sA", sa), ("sB", sb), ("sC", sc)]])
+    y_all = np.concatenate([ya, yb, yc])
+    assert ap(y_all, p_all) > 0.95
+    assert ece(y_all, p_all) < 0.02

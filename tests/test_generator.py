@@ -190,11 +190,13 @@ def test_v1_behavioral_realism_invariants():
     regular_fresh = agents[(agents.is_mule == 0) & (agents.tenure0_days < 30)]
     assert len(regular_fresh) > 0
 
-    # 5. Calibration report passes and audits 70/15/15 split typology coverage
+    # 5. Calibration report passes and audits 70/15/15 split typology & per-silo fraud counts
     rep = calibration_report(tx, cfg)
     assert rep["ok"], [c for c in rep["checks"] if not c["ok"]]
     assert set(rep["split_typology_counts"].keys()) == {"train", "val", "test"}
     assert isinstance(rep["split_typology_coverage_ok"], bool)
+    assert len(rep["per_silo_split_fraud_counts"]) == tx.silo_id.nunique()
+    assert sum(sum(d.values()) for d in rep["per_silo_split_fraud_counts"].values()) == int(tx.is_fraud.sum())
 
     # 6. MULE fan-outs are NOT artificially pushed to the horizon tail (per-batch laundering)
     mule_tr = rep["split_typology_counts"]["train"].get("MULE", 0)

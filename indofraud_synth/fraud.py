@@ -124,6 +124,26 @@ def inject_fraud(cfg: SynthConfig, rng: np.random.Generator, legit: pd.DataFrame
     # Ensure MULE runs after ATO/APP within each rail so intake events exist.
     typ_order = {"ATO": 0, "APP": 1, "QRIS_ABUSE": 2, "MULE": 3}
 
+    # Active mule-ring wave pools: scam campaigns concentrate 70% of payee drops onto
+    # a rotating 2-day mule-ring subset so `payee_indegree_24h` reflects realistic
+    # multi-victim fan-in without creating a deterministic shortcut.
+    wave_rng = np.random.default_rng(int(cfg.seed) + 1009)
+    wave_size = max(3, min(8, len(mule_ids) // 8))
+    n_waves = max(cfg.horizon_days // 2 + 2, 2)
+    wave_pools = [wave_rng.choice(mule_ids, min(wave_size, len(mule_ids)), replace=False)
+                  for _ in range(n_waves)]
+
+    def pick_mules(t0: int, legs: int) -> np.ndarray:
+        w_idx = int(np.clip((t0 - start_epoch) // (2 * 86400), 0, n_waves - 1))
+        in_wave = wave_rng.random(legs) < 0.70
+        out_m = np.empty(legs, dtype=mule_ids.dtype)
+        n_w = int(in_wave.sum())
+        if n_w:
+            out_m[in_wave] = wave_rng.choice(wave_pools[w_idx], n_w)
+        if legs - n_w:
+            out_m[~in_wave] = wave_rng.choice(mule_ids, legs - n_w)
+        return out_m
+
     for rail in rail_names:
         n_legit_rail = int((legit.rail == ridx[rail]).sum())
         target = int(round(cfg.fraud_rates.get(rail, 0.0) * n_legit_rail))
@@ -151,7 +171,7 @@ def inject_fraud(cfg: SynthConfig, rng: np.random.Generator, legit: pd.DataFrame
                     ts = bounded_leg_ts(
                         t0, np.sort(rng.integers(60, int(2400 * gap_d), legs)).cumsum(),
                     )
-                    payees = rng.choice(mule_ids, legs)
+                    payees = pick_mules(t0, legs)
                     base_amt = max(means[rail] * 4.5, 300_000) * amt_d
                     amt = np.clip(np.exp(rng.normal(np.log(base_amt), 0.85, legs)),
                                   50_000, caps[rail])
@@ -197,7 +217,7 @@ def inject_fraud(cfg: SynthConfig, rng: np.random.Generator, legit: pd.DataFrame
                         m_cats = merch_cats[merch]
                         reg_mm = (merch_regions[merch] != agent_regions[victim]).astype(np.int8)
                     else:
-                        payees = rng.choice(mule_ids, legs)
+                        payees = pick_mules(t0, legs)
                         for p, t_leg, a in zip(payees, ts, amt):
                             received[int(p)].append((int(t_leg), int(a)))
                         m_ids = np.full(legs, -1)
@@ -221,7 +241,11 @@ def inject_fraud(cfg: SynthConfig, rng: np.random.Generator, legit: pd.DataFrame
                         break
                     if produced > 0 and need - produced < 2:
                         break
-                    mule = int(rng.choice(funded))
+                    # Weight mule selection by pending intake count so heavily-used
+                    # wave mules are laundered proportionally to intake timestamps.
+                    f_weights = np.array([len(received[m]) for m in funded], dtype=np.float64)
+                    f_weights /= f_weights.sum()
+                    mule = int(rng.choice(funded, p=f_weights))
                     events = sorted(received[mule], key=lambda ev: ev[0])
                     legs = int(rng.integers(2, 6))
                     legs = min(legs, max(need - produced, 1 if need < 2 else 2))

@@ -34,19 +34,22 @@ def calibration_report(tx: pd.DataFrame, cfg: SynthConfig) -> dict:
         add(f"mean_ticket[{r}]", sub.amount.mean(), cfg.rails[r]["mean"], 0.15)
         add(f"fraud_rate[{r}]", sub.is_fraud.mean(), cfg.fraud_rates.get(r, 0.0), 0.40)
 
-    # seasonality presence checks
-    daily = tx.groupby((tx.ts - tx.ts.min()) // 86400).size()
+    # seasonality presence checks (anchored strictly on cfg.start_date)
+    start_epoch = int(pd.Timestamp(cfg.start_date).timestamp())
+    day_idx = np.clip(((tx.ts.to_numpy(np.int64) - start_epoch) // 86400).astype(int),
+                      0, cfg.horizon_days - 1)
+    daily = pd.Series(day_idx).value_counts().reindex(range(cfg.horizon_days), fill_value=0)
     days = pd.date_range(pd.Timestamp(cfg.start_date), periods=cfg.horizon_days, freq="D")
-    dom = days.day.to_numpy()[: len(daily)]
+    dom = days.day.to_numpy()
     payday_mask = np.isin(dom, [25, 26, 27, 28, 29, 30, 31, 1])
     if payday_mask.any() and (~payday_mask).any():
-        uplift = daily.to_numpy()[payday_mask].mean() / daily.to_numpy()[~payday_mask].mean()
+        uplift = daily.to_numpy()[payday_mask].mean() / max(daily.to_numpy()[~payday_mask].mean(), 1e-9)
         add("payday_uplift", uplift, (1.15, 2.6), None, kind="range")
     promo_days = pd.to_datetime(cfg.promo_days)
-    p_idx = [i for i, d in enumerate(days[: len(daily)]) if d in promo_days]
+    p_idx = [i for i, d in enumerate(days) if d in promo_days]
     if p_idx:
         base = np.delete(daily.to_numpy(), p_idx).mean()
-        add("promo_uplift", daily.to_numpy()[p_idx].mean() / base, (1.4, 6.0), None,
+        add("promo_uplift", daily.to_numpy()[p_idx].mean() / max(base, 1e-9), (1.4, 6.0), None,
             kind="range")
 
     hour_counts = tx.groupby("hour").size()
@@ -94,12 +97,23 @@ def calibration_report(tx: pd.DataFrame, cfg: SynthConfig) -> dict:
             "ok": bool(split_cov_ok),
         })
 
+    silo_names = tx.attrs.get("silo_names", [])
+    per_silo_split_fraud: dict[str, dict[str, int]] = {}
+    for sid in sorted(tx.silo_id.unique()):
+        sname = silo_names[int(sid)] if int(sid) < len(silo_names) else str(int(sid))
+        smask = tx.silo_id.to_numpy() == sid
+        per_silo_split_fraud[sname] = {
+            sp_name: int(tx.is_fraud.to_numpy()[smask & (sp == sp_name)].sum())
+            for sp_name in ("train", "val", "test")
+        }
+
     ok = all(c["ok"] for c in checks)
     return {"ok": ok, "checks": checks,
             "silo_sizes": {str(k): int(v) for k, v in silo_sizes.items()},
             "typology_counts": {k: int(v) for k, v in tx.typology.value_counts().items()},
             "split_typology_counts": split_typ,
-            "split_typology_coverage_ok": bool(split_cov_ok)}
+            "split_typology_coverage_ok": bool(split_cov_ok),
+            "per_silo_split_fraud_counts": per_silo_split_fraud}
 
 
 def report_markdown(report: dict) -> str:
@@ -114,7 +128,9 @@ def report_markdown(report: dict) -> str:
               "", "## Typology counts", "```json",
               json.dumps(report["typology_counts"], indent=2), "```",
               "", "## Temporal 70/15/15 split typology counts", "```json",
-              json.dumps(report.get("split_typology_counts", {}), indent=2), "```"]
+              json.dumps(report.get("split_typology_counts", {}), indent=2), "```",
+              "", "## Per-silo 70/15/15 fraud counts", "```json",
+              json.dumps(report.get("per_silo_split_fraud_counts", {}), indent=2), "```"]
     return "\n".join(lines)
 
 
