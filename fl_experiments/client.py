@@ -33,27 +33,33 @@ class ClientCfg:
 
 
 class FraudClient:
-    def __init__(self, name, model_type, frames, cfg: ClientCfg, pre: MLPPreprocessor | None = None):
+    def __init__(self, name, model_type, frames, cfg: ClientCfg, pre: MLPPreprocessor | None = None,
+                 shared_raw: tuple[dict, dict, dict] | None = None):
         self.name = name
         self.model_type = model_type
         self.cfg = cfg
-        self.X = {}; self.y = {}; self.amt = {}
-        for split in ("train", "val", "test"):
-            df = frames[split]
-            X, _ = build_matrix(df, cfg.dataset)
-            self.X[split] = X
-            self.y[split] = df.is_fraud.to_numpy(np.int8)
-            if "amount" in df:
-                self.amt[split] = df["amount"].to_numpy(np.float64)
-            elif "Amount" in df:
-                self.amt[split] = df["Amount"].to_numpy(np.float64)
-            else:
-                self.amt[split] = np.zeros(len(df))
+        if shared_raw is not None:
+            raw_X, raw_y, raw_amt = shared_raw
+            self.X = {s: raw_X[s] for s in ("train", "val", "test")}
+            self.y = raw_y
+            self.amt = raw_amt
+        else:
+            self.X = {}; self.y = {}; self.amt = {}
+            for split in ("train", "val", "test"):
+                df = frames[split]
+                X, _ = build_matrix(df, cfg.dataset)
+                self.X[split] = X
+                self.y[split] = df.is_fraud.to_numpy(np.int8)
+                if "amount" in df:
+                    self.amt[split] = df["amount"].to_numpy(np.float64)
+                elif "Amount" in df:
+                    self.amt[split] = df["Amount"].to_numpy(np.float64)
+                else:
+                    self.amt[split] = np.zeros(len(df))
         self.pre = None
         if model_type == "mlp":
             self.pre = pre if pre is not None else MLPPreprocessor().fit(self.X["train"])
-            for s in self.X:
-                self.X[s] = self.pre.transform(self.X[s])
+            self.X = {s: self.pre.transform(self.X[s]) for s in ("train", "val", "test")}
             self.in_dim = self.X["train"].shape[1]
         self.local_bn = None    # FedBN: latest local BatchNorm slots
         self.bn_history: dict[int, dict[int, np.ndarray]] = {}  # round -> BN slots

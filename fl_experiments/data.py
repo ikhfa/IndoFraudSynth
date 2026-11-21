@@ -89,22 +89,39 @@ def load_ieee_cis(path: str) -> pd.DataFrame:
     if os.path.exists(id_path):
         ident = pd.read_csv(id_path)
         df = df.merge(ident, on="TransactionID", how="left")
+        del ident
 
-    df["is_fraud"] = df["isFraud"].astype(np.int8)
-    df["ts"] = df["TransactionDT"].astype(np.int64)
-    df["amount"] = df["TransactionAmt"].astype(np.float64)
-    df["amount_log"] = np.log1p(np.maximum(df["amount"], 0.0))
-    df["hour"] = ((df["ts"] // 3600) % 24).astype(np.int8)
-    df["dow"] = ((df["ts"] // 86400) % 7).astype(np.int8)
-    df["silo_id"] = 0
+    ts_arr = df["TransactionDT"].to_numpy(np.int64)
+    amt_arr = df["TransactionAmt"].to_numpy(np.float64)
+    extra = pd.DataFrame({
+        "is_fraud": df["isFraud"].to_numpy(np.int8),
+        "ts": ts_arr,
+        "amount": amt_arr,
+        "amount_log": np.log1p(np.maximum(amt_arr, 0.0)).astype(np.float32),
+        "hour": ((ts_arr // 3600) % 24).astype(np.int8),
+        "dow": ((ts_arr // 86400) % 7).astype(np.int8),
+        "silo_id": np.zeros(len(df), dtype=np.int8),
+    }, index=df.index)
 
     drop_cols = [c for c in ("TransactionID", "isFraud", "TransactionDT") if c in df.columns]
     df = df.drop(columns=drop_cols)
+    # Downcast wide IEEE-CIS float64 columns to float32 before concat/sort to halve RAM
+    f64_cols = df.select_dtypes(include=["float64"]).columns
+    if len(f64_cols):
+        df[f64_cols] = df[f64_cols].astype(np.float32)
+    i64_cols = df.select_dtypes(include=["int64"]).columns
+    if len(i64_cols):
+        df[i64_cols] = df[i64_cols].astype(np.int32)
+    df = pd.concat([df, extra], axis=1)
+    del extra
 
     df = df.sort_values("ts", kind="stable").reset_index(drop=True)
     obj_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
     df = _encode_object_cols(df, obj_cols, fit_prefix_frac=0.7)
-    df = df.replace([np.inf, -np.inf], np.nan)
+    for c in df.select_dtypes(include=[np.floating]).columns:
+        arr = df[c].to_numpy(copy=False)
+        if np.isinf(arr).any():
+            df[c] = np.where(np.isinf(arr), np.nan, arr).astype(arr.dtype, copy=False)
     df.attrs["silo_names"] = ["pooled"]
     return df
 
@@ -179,7 +196,10 @@ def load_sparkov(path: str) -> pd.DataFrame:
     df = df.sort_values("ts", kind="stable").reset_index(drop=True)
     obj_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
     df = _encode_object_cols(df, obj_cols, fit_prefix_frac=0.7)
-    df = df.replace([np.inf, -np.inf], np.nan)
+    for c in df.select_dtypes(include=[np.floating]).columns:
+        arr = df[c].to_numpy(copy=False)
+        if np.isinf(arr).any():
+            df[c] = np.where(np.isinf(arr), np.nan, arr).astype(arr.dtype, copy=False)
     df.attrs["silo_names"] = ["pooled"]
     return df
 

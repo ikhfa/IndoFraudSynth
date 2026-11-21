@@ -365,6 +365,7 @@ def main():
         args.partition = "dirichlet"
     clients_df, pooled = make_clients(df, args.partition, args.k, args.alpha,
                                       args.seed, args.train_cap)
+    del df
     print(f"Clients: { {k: len(v['train']) for k, v in clients_df.items()} }")
 
     # FL-safe global MLP standardization & pos_weight from per-client scalar sufficient
@@ -386,9 +387,27 @@ def main():
     ccfg = ClientCfg(t0=args.t0, local_iters=args.local_iters, mlp_epochs=args.mlp_epochs,
                      mlp_pos_weight=fed_mlp_pw, prox_mu=args.prox_mu, mlp_agg=args.mlp_agg,
                      seed=args.seed, dataset=args.dataset, bn_state_dir=bn_dir)
+    # Build unscaled feature matrices once per client and share across models (halves RAM)
+    shared_by_silo = {}
+    for name, frames in clients_df.items():
+        sx, sy, sa = {}, {}, {}
+        for sp in ("train", "val", "test"):
+            df_sp = frames[sp]
+            sx[sp], _ = build_matrix(df_sp, args.dataset)
+            sy[sp] = df_sp.is_fraud.to_numpy(np.int8)
+            if "amount" in df_sp:
+                sa[sp] = df_sp["amount"].to_numpy(np.float64)
+            elif "Amount" in df_sp:
+                sa[sp] = df_sp["Amount"].to_numpy(np.float64)
+            else:
+                sa[sp] = np.zeros(len(df_sp))
+        shared_by_silo[name] = (sx, sy, sa)
+
     cores = {mt: [FraudClient(name, mt, frames, ccfg,
-                              pre=(fed_pre if mt == "mlp" else None))
+                              pre=(fed_pre if mt == "mlp" else None),
+                              shared_raw=shared_by_silo[name])
                   for name, frames in clients_df.items()] for mt in model_types}
+    del shared_by_silo
 
     engine = run_flower_engine if args.engine == "flower" else run_local_engine
     size_weighted = args.tree_weight == "size"
