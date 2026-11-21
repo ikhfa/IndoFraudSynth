@@ -1,0 +1,29 @@
+# IndoFraud-Synth quick demo config (small, sandbox-friendly)
+synth:
+  seed: 42
+  n_customers: 4000
+  n_merchants: 600
+  horizon_days: 90
+  start_date: "2025-09-15"     # covers Harbolnas 11.11 and 12.12
+  base_activity: 0.7
+  out_dir: data/quick
+
+experiment:
+  data: data/quick
+  engine: local
+  models: xgboost,catboost,mlp
+  partition: profile
+  k: 5
+  rounds: 3
+  t0: 120
+  local_iters: 15
+  mlp_epochs: 2
+  mlp_agg: fedavg
+  tree_agg: normalized
+  tree_budget: 400
+  train_cap: 120000
+  cent_iters: 300
+  cent_epochs: 6
+  seed: 42
+  c_fp: 7500
+  out: results/quick_normalized

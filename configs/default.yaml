@@ -1,0 +1,36 @@
+# IndoFraud-Synth full-scale config (workstation; publication experiments)
+synth:
+  seed: 42
+  n_customers: 50000
+  n_merchants: 5000
+  horizon_days: 180
+  start_date: "2025-07-01"
+  base_activity: 0.7
+  out_dir: data/full
+
+experiment:
+  data: data/full
+  engine: flower
+  models: xgboost,catboost,mlp
+  partition: profile
+  k: 10
+  rounds: 10
+  t0: 300
+  local_iters: 20
+  mlp_epochs: 5
+  mlp_agg: fedbn          # ablate: fedavg | fedprox | fedbn
+  prox_mu: 0.01
+  tree_agg: normalized
+  tree_budget: 800
+  train_cap: 400000
+  cent_iters: 600
+  cent_epochs: 10
+  seed: 42
+  c_fp: 7500
+  out: results/full_normalized
+
+# Publication protocol reminders (see Extension plan):
+# - run >= 5 seeds (--seed 1..5), both --tree-agg baseline and normalized
+# - partitions: profile, equal, dirichlet --alpha 0.1 / 0.5 / 5
+# - datasets: indofraud + ULB + IEEE-CIS + Sparkov
+# - report mean +/- 95% CI; Friedman + Nemenyi per dataset

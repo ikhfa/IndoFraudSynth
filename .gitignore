@@ -1,0 +1,30 @@
+# Python / virtualenvs
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Generated datasets & experiment outputs
+data/
+results/
+_bn_state/
+*.csv.gz
+*.cbm
+*.npz
+
+# Reference PDFs / extracted text (do not redistribute in public repo)
+uploads/
+paper.txt
+
+# OS / editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
