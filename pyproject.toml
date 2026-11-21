@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "indofraud-synth"
+version = "0.1.0"
+description = "Calibrated Indonesian multi-rail synthetic payment fraud benchmark and skew-aware federated ensemble framework."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "numpy>=1.26.4",
+    "pandas>=2.2.2",
+    "scikit-learn>=1.5.1",
+    "scipy>=1.13.1",
+    "xgboost>=2.1.1",
+    "catboost>=1.2.7",
+    "flwr>=1.13.0",
+    "matplotlib>=3.9.2",
+    "pyyaml>=6.0",
+    "pyarrow>=15.0",
+]
+
+[project.optional-dependencies]
+cpu = [
+    "torch>=2.5.0",
+]
+cu124 = [
+    "torch>=2.5.0",
+]
+simulation = [
+    "flwr[simulation]>=1.13.0",
+]
+
+[project.scripts]
+indofraud-synth = "indofraud_synth.cli:main"
+indofraud-fl = "fl_experiments.run_fl:main"
+indofraud-suite = "fl_experiments.run_suite:main"
+indofraud-stats = "fl_experiments.stats:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["indofraud_synth", "fl_experiments"]
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "cu124" },
+    ],
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu124", extra = "cu124" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

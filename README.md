@@ -61,31 +61,31 @@ IndoFraudSynth/
 
 ## Setup
 
-Python 3.11+ is recommended. Using [`uv`](https://docs.astral.sh/uv/) is the fastest way to create and populate the environment:
+Python 3.11–3.12 is recommended. Using [`uv`](https://docs.astral.sh/uv/) is the fastest way to manage the environment via `pyproject.toml`:
 
 ```bash
 # Install uv if needed:
 #   Linux/macOS: curl -LsSf https://astral.sh/uv/install.sh | sh
 #   Windows:     powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 
-uv venv .venv --python 3.11
-# Windows PowerShell:
-.\.venv\Scripts\Activate.ps1
-# Linux / macOS:
-# source .venv/bin/activate
+# CPU-only workstation / laptop:
+uv sync --extra cpu
 
-uv pip install -r requirements.txt
-# Optional: install pyarrow for automatic fast Parquet dataset caching
-uv pip install pyarrow
-# Optional: install Ray for multi-process Flower simulation
-# uv pip install "flwr[simulation]"
+# NVIDIA CUDA 12.4 GPU workstation:
+# uv sync --extra cu124
+
+# Optional: add Ray multi-process Flower simulation
+# uv sync --extra cpu --extra simulation
 ```
 
-Run the test suite to verify the installation:
+Run tests or experiments directly with `uv run` (no manual venv activation needed):
 
 ```bash
-python -m pytest -v
+uv run --extra cpu pytest -v
+uv run --extra cpu indofraud-suite --config configs/quick.yaml --seeds 1,2,3 --out results/suite_quick
 ```
+
+*(You can also run `uv run --no-sync python -m ...` if you want to reuse an existing `.venv` without modifying installed packages.)*
 
 ---
 
