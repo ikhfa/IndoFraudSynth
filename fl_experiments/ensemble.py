@@ -83,11 +83,13 @@ class PlattCalibrator:
         return expit(self.slope_ * z + self.intercept_)
 
 
-def _make_calibrator(y: np.ndarray):
-    """Choose low-variance Platt scaling for 5..49 positives, Isotonic for >= 50."""
+def _make_calibrator(y: np.ndarray, isotonic_min_pos: int = 500):
+    """Choose smooth, rank-preserving Platt scaling for 5..(isotonic_min_pos-1) positives,
+    and Isotonic regression only when positives >= isotonic_min_pos (avoids coarse
+    piecewise-constant step ties degrading AUC-PR under severe fraud imbalance)."""
     pos = int(np.asarray(y).sum())
     neg = int(len(y) - pos)
-    if pos >= 50 and neg >= 50:
+    if pos >= isotonic_min_pos and neg >= isotonic_min_pos:
         return IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0), "isotonic"
     if pos >= 5 and neg >= 5:
         return PlattCalibrator(), "platt"
@@ -116,8 +118,9 @@ def _agg_platt_params(platt_params: dict[str, tuple[float, float, int]],
 
 def _shrink_platt(cal: PlattCalibrator, global_ab: tuple[float, float] | None,
                   pos: int, prior_strength: float = 15.0) -> PlattCalibrator:
-    """Empirical-Bayes shrinkage of a small-silo Platt fit toward federated global (a, b)."""
-    if global_ab is None or pos >= 50:
+    """Empirical-Bayes shrinkage of a Platt fit toward federated global (a, b).
+    Weight gamma = pos / (pos + prior_strength) smoothly approaches 1.0 for large silos."""
+    if global_ab is None or pos >= 500:
         return cal
     gamma = float(pos) / (float(pos) + float(prior_strength))
     a_g, b_g = global_ab
@@ -183,10 +186,11 @@ def search_weights(val_scores, y_vals, n_draws=300, seed=42):
 def fit_calibrators(val_scores, y_vals, seed: int = 42, prior_strength: float = 15.0):
     """Per-silo calibration with FL-safe hierarchical Platt shrinkage & global fallback.
 
-    - Silos with >=50 positives use Isotonic regression (locking the same family in OOF).
-    - Silos with 5..49 positives use Platt scaling; when multiple silos exist, local
-      `(a_k, b_k)` parameters are shrunk toward the FL-safe global Platt average
-      `(a_global, b_global)` (only 2 scalars + positive count shared per silo).
+    - Silos with >=500 positives use Isotonic regression (locking the same family in OOF).
+    - Silos with 5..499 positives use smooth, strictly monotonic Platt scaling (avoiding
+      piecewise-constant Isotonic step ties under rare-event imbalance); when multiple
+      silos exist, local `(a_k, b_k)` parameters are shrunk toward the FL-safe global
+      Platt average `(a_global, b_global)` (only 2 scalars + positive count shared/silo).
     - Silos with <5 positives fall back to the federated global Platt calibrator
       (`platt_global`) instead of raw uncalibrated scores, preventing cross-silo
       score-scale mismatches in pooled evaluation and Bayes decisions.

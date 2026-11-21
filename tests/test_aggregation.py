@@ -482,3 +482,36 @@ def test_mlp_prior_correction_and_xgb_predict_fast():
     bst = M.train_xgb(X, y, 15, seed=0)
     assert np.allclose(M.xgb_predict_fast(bst, X[:50]),
                        M.xgb_predict_loaded(bst, X[:50]), atol=1e-5)
+
+
+def test_flower_strategy_aggregate_fit_is_cid_order_invariant(data):
+    """TreeBaggingStrategy.aggregate_fit must produce identical merged models
+    regardless of the order in which Ray returns client fit results."""
+    from types import SimpleNamespace
+    from flwr.common import FitRes, Status, Code, ndarrays_to_parameters
+    from fl_experiments.strategy import TreeBaggingStrategy
+
+    X, y = data
+    b1 = M.xgb_to_bytes(M.train_xgb(X[:200], y[:200], 15, seed=1))
+    b2 = M.xgb_to_bytes(M.train_xgb(X[200:400], y[200:400], 15, seed=2))
+    b3 = M.xgb_to_bytes(M.train_xgb(X[400:], y[400:], 15, seed=3))
+
+    def _item(cid, payload, n):
+        proxy = SimpleNamespace(cid=str(cid))
+        res = FitRes(
+            status=Status(code=Code.OK, message=""),
+            parameters=ndarrays_to_parameters([np.frombuffer(payload, dtype=np.uint8).copy()]),
+            num_examples=n,
+            metrics={},
+        )
+        return (proxy, res)
+
+    items_fwd = [_item(0, b1, 100), _item(1, b2, 200), _item(2, b3, 300)]
+    items_rev = list(reversed(items_fwd))
+
+    # Budget=20 forces uneven remainder split (7, 7, 6) across 3 clients
+    s1 = TreeBaggingStrategy("xgboost", normalize=True, budget=20, min_clients=3, size_weighted=True)
+    s2 = TreeBaggingStrategy("xgboost", normalize=True, budget=20, min_clients=3, size_weighted=True)
+    s1.aggregate_fit(1, items_fwd, [])
+    s2.aggregate_fit(1, items_rev, [])
+    assert np.allclose(_margins(s1.current, X), _margins(s2.current, X), atol=1e-6)

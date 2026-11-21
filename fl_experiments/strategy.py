@@ -117,9 +117,13 @@ class TreeBaggingStrategy(FedAvg, _BestTracker):
     def aggregate_fit(self, server_round, results, failures):
         if failures or not results:
             return None, {}
+        ordered = sorted(
+            results,
+            key=lambda item: (int(item[0].cid) if str(item[0].cid).isdigit() else str(item[0].cid)),
+        )
         payloads = [parameters_to_ndarrays(res.parameters)[0].tobytes()
-                    for _, res in results]
-        c_weights = ([res.num_examples for _, res in results]
+                    for _, res in ordered]
+        c_weights = ([res.num_examples for _, res in ordered]
                      if (self.normalize and self.size_weighted) else None)
         merged = merge_trees(self.model_kind, payloads, global_payload=self.current,
                              normalize=self.normalize, n_prev=self.n_prev,
@@ -130,7 +134,7 @@ class TreeBaggingStrategy(FedAvg, _BestTracker):
         if server_round == 1:
             self.foundation = self.n_prev
         up = sum(len(p) for p in payloads)
-        down = len(merged) * len(results)
+        down = len(merged) * len(ordered)
         self.total_client_bytes += up
         self.total_broadcast_bytes += down
         metrics = {"global_n_trees": int(self.n_prev),
@@ -179,14 +183,17 @@ class MLPStrategy(FedAvg, _BestTracker):
     def aggregate_fit(self, server_round, results, failures):
         if failures or not results:
             return None, {}
-        lists = [parameters_to_ndarrays(res.parameters) for _, res in results]
-        weights = [res.num_examples for _, res in results]
+        ordered = sorted(
+            results,
+            key=lambda item: (int(item[0].cid) if str(item[0].cid).isdigit() else str(item[0].cid)),
+        )
+        lists = [parameters_to_ndarrays(res.parameters) for _, res in ordered]
+        weights = [res.num_examples for _, res in ordered]
         merged = merge_mlp(lists, weights)
         self.current = merged
-        up = sum(int(sum(a.nbytes for a in parameters_to_ndarrays(res.parameters)))
-                 for _, res in results)
+        up = sum(int(sum(a.nbytes for a in plist)) for plist in lists)
         size_bytes = int(sum(a.nbytes for a in merged))
-        down = size_bytes * len(results)
+        down = size_bytes * len(ordered)
         self.total_client_bytes += up
         self.total_broadcast_bytes += down
         self.note_fit(server_round, size_bytes, up, down)

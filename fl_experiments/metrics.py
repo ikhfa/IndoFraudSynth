@@ -142,16 +142,40 @@ def bayes_savings(y, p, amounts, c_fp: float = 7500.0, max_alert_rate: float | N
 
 
 def cost_threshold(y, s, amounts, c_fp: float = 7500.0):
-    """Threshold minimizing cost on validation data."""
-    s = np.asarray(s)
+    """Exact threshold minimizing expected fraud + FP review cost on validation data.
+
+    Sweeps every distinct score cutoff in O(N log N) via sorted cumulative sums
+    so rare-event optimal thresholds in the >99.9th percentile tail are found
+    exactly rather than missed by a coarse quantile grid.
+    """
+    y = np.asarray(y, dtype=np.int8)
+    s = np.asarray(s, dtype=np.float64)
+    amounts = np.asarray(amounts, dtype=np.float64)
     if len(s) == 0:
         return 0.5, 0.0
-    thrs = np.unique(np.quantile(s, np.linspace(0.001, 0.999, 250)))
-    best_t, best_c = 0.5, float("inf")
-    for t in thrs:
-        c = fraud_cost(y, s, t, amounts, c_fp)
-        if c < best_c:
-            best_c, best_t = c, float(t)
+
+    order = np.argsort(-s, kind="mergesort")
+    s_ord = s[order]
+    y_ord = y[order]
+    a_ord = amounts[order]
+
+    total_fraud_loss = float(a_ord[y_ord == 1].sum())
+    # Baseline option: flag nothing (threshold strictly above max score)
+    best_t = float(s_ord[0] + max(abs(s_ord[0]) * 1e-6, 1e-12))
+    best_c = total_fraud_loss
+
+    cum_caught = np.cumsum(np.where(y_ord == 1, a_ord, 0.0))
+    cum_fp = np.cumsum(y_ord == 0, dtype=np.float64)
+
+    # Evaluate only at the last index of each distinct score tie-group, matching `s >= thr`
+    group_ends = np.flatnonzero(
+        np.r_[s_ord[:-1] != s_ord[1:], True]
+    )
+    costs = (total_fraud_loss - cum_caught[group_ends]) + c_fp * cum_fp[group_ends]
+    min_idx = int(np.argmin(costs))
+    if float(costs[min_idx]) < best_c:
+        best_c = float(costs[min_idx])
+        best_t = float(s_ord[group_ends[min_idx]])
     return best_t, best_c
 
 

@@ -358,8 +358,8 @@ def extract_cat_delta(full_payload: bytes, n_prev: int) -> bytes:
     params = mi.get("params", {})
     if isinstance(params, dict) and "iteration_count" in params:
         params["iteration_count"] = str(len(delta))
-    if "model_scale_and_bias" in mi:
-        mi["model_scale_and_bias"] = [1.0, 0.0]
+    if "scale_and_bias" in j:
+        j["scale_and_bias"] = [1.0, [0.0]]
     return _cat_json_to_native(j)
 
 
@@ -423,9 +423,9 @@ def merge_cat(client_payloads, global_payload=None, normalize=False, n_prev=0,
     params = mi.get("params", {})
     if isinstance(params, dict) and "iteration_count" in params:
         params["iteration_count"] = str(len(trees))
-    # Logloss models use scale=1, bias=0; enforce if the key exists.
-    if "model_scale_and_bias" in mi:
-        mi["model_scale_and_bias"] = [1.0, 0.0]
+    # Logloss models use top-level scale=1, bias=[0]; enforce additive zero-bias form.
+    if "scale_and_bias" in base:
+        base["scale_and_bias"] = [1.0, [0.0]]
     return _cat_json_to_native(base)
 
 

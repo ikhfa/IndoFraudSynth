@@ -124,3 +124,30 @@ def test_hierarchical_platt_global_fallback_and_oof_consistency():
     y_all = np.concatenate([ya, yb, yc])
     assert ap(y_all, p_all) > 0.95
     assert ece(y_all, p_all) < 0.02
+
+
+def test_exact_cost_threshold_rare_tail_and_medium_silo_platt():
+    """Regression tests:
+    1. Exact O(N log N) cost_threshold finds rare-event cutoffs above the 99.9th
+       percentile (previously missed by 250-quantile grid).
+    2. Medium rare-event silos (pos=120 < 500) use smooth Platt scaling rather than
+       step-quantized Isotonic regression, preserving exact per-silo AP ranking.
+    """
+    rng = np.random.default_rng(123)
+    n_neg, n_pos = 10_000, 5  # 0.05% fraud -> optimal cutoff at 99.95th percentile!
+    y = np.array([0] * n_neg + [1] * n_pos, dtype=np.int8)
+    s = np.concatenate([rng.uniform(0.0, 0.2, n_neg), rng.uniform(0.8, 0.99, n_pos)])
+    amt = np.full(n_neg + n_pos, 1_000_000.0)
+    thr, best_c = cost_threshold(y, s, amt, c_fp=7500.0)
+    # Exact optimal threshold catches all 5 frauds with 0 false positives (cost == 0)
+    assert best_c == 0.0
+    assert fraud_cost(y, s, thr, amt, c_fp=7500.0) == 0.0
+    assert savings(y, s, thr, amt, c_fp=7500.0) == 1.0
+
+    # Medium silo with 120 positives must choose smooth Platt (no Isotonic tie collapse)
+    y_med = np.array([0] * 5000 + [1] * 120, dtype=np.int8)
+    s_med = np.concatenate([rng.beta(1, 20, 5000), rng.beta(4, 2, 120)])
+    cals, methods, _ = fit_calibrators({"xgb": {"s_med": s_med}}, {"s_med": y_med}, seed=42)
+    assert methods["xgb"]["s_med"] == "platt"
+    pred_med = cals["xgb"]["s_med"].predict(s_med)
+    assert np.isclose(ap(y_med, pred_med), ap(y_med, s_med), atol=1e-6)

@@ -205,3 +205,38 @@ def test_v1_behavioral_realism_invariants():
         assert mule_tr / mule_tot >= 0.50, (
             f"MULE fan-out skewed into val/test tail: train={mule_tr}/{mule_tot}"
         )
+
+
+def test_proportional_train_cap_preserves_skew_and_config_deepcopy(tiny, tmp_path):
+    """Regression tests:
+    1. `make_clients` with `train_cap` scales all silos proportionally rather than
+       flattening the largest silos to a uniform cap, and `train_cap=0` leaves rows uncapped.
+    2. `SynthConfig.from_yaml` must not mutate module-level `DEFAULT_RAILS`.
+    """
+    from indofraud_synth.config import DEFAULT_RAILS
+    from fl_experiments.data import temporal_split, make_clients
+
+    _, data = tiny
+    df, _ = temporal_split(data["transactions"])
+    c_full, _ = make_clients(df, mode="profile", k=5, train_cap=0, seed=42)
+    full_sizes = {k: len(v["train"]) for k, v in c_full.items()}
+    max_full = max(full_sizes.values())
+    min_full = min(full_sizes.values())
+    orig_ratio = max_full / min_full
+
+    cap = max(max_full // 2, 100)
+    c_cap, pooled_cap = make_clients(df, mode="profile", k=5, train_cap=cap, seed=42)
+    cap_sizes = {k: len(v["train"]) for k, v in c_cap.items()}
+    assert max(cap_sizes.values()) <= cap
+    assert len(pooled_cap["train"]) == sum(cap_sizes.values())
+    # Max/min quantity skew ratio must be preserved within ~5%
+    cap_ratio = max(cap_sizes.values()) / min(cap_sizes.values())
+    assert abs(cap_ratio - orig_ratio) / orig_ratio < 0.05
+
+    # Config deepcopy guard
+    orig_qris = DEFAULT_RAILS["QRIS"]["share"]
+    yfile = tmp_path / "custom.yaml"
+    yfile.write_text("synth:\n  seed: 99\n")
+    cfg = SynthConfig.from_yaml(str(yfile))
+    cfg.rails["QRIS"]["share"] = 0.12345
+    assert DEFAULT_RAILS["QRIS"]["share"] == orig_qris

@@ -22,8 +22,9 @@ experiment:
   mlp_agg: fedbn          # ablate: fedavg | fedprox | fedbn
   prox_mu: 0.01
   tree_agg: normalized
+  tree_weight: size
   tree_budget: 2000       # ~200 effective boosting steps across K=10 (vs 4,800 unbudgeted baseline)
-  train_cap: 400000
+  train_cap: 0            # 0 = uncapped (preserves exact 15x KBMI skew; >0 scales all silos proportionally)
   cent_iters: 600
   cent_epochs: 10
   seed: 42

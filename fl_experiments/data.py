@@ -233,9 +233,10 @@ def random_split(df: pd.DataFrame, train_frac: float = 0.7, val_frac: float = 0.
                 "train_frac": float(train_frac), "val_frac": float(val_frac)}
 
 
-def subsample_train(train: pd.DataFrame, cap: int, seed: int = 42) -> pd.DataFrame:
-    """Stratified training cap: preserves the true fraud prior (avoids prior distortion)."""
-    if len(train) <= cap:
+def subsample_train(train: pd.DataFrame, cap: int | None, seed: int = 42) -> pd.DataFrame:
+    """Stratified training cap: preserves the true fraud prior (avoids prior distortion).
+    Pass `cap=0` or `cap=None` to keep all training rows uncapped."""
+    if not cap or cap <= 0 or len(train) <= cap:
         return train
     rng = np.random.default_rng(seed)
     fraud = train[train.is_fraud == 1]
@@ -250,16 +251,34 @@ def subsample_train(train: pd.DataFrame, cap: int, seed: int = 42) -> pd.DataFra
 
 
 def make_clients(df: pd.DataFrame, mode: str, k: int, alpha: float = 0.5,
-                 seed: int = 42, train_cap: int = 200_000):
+                 seed: int = 42, train_cap: int | None = 200_000):
     """Return (clients dict, pooled dict).
+
+    When `train_cap` is positive and exceeded by the largest silo, all silos are
+    scaled by the SAME proportional factor `train_cap / max_client_train` so
+    institutional quantity skew (e.g., 15x KBMI ratio) and pooled silo weights
+    are preserved rather than flattening large silos to a uniform ceiling.
+    Pass `train_cap=0` or `None` to train uncapped.
 
     `pooled['train']` is the exact union of all clients' training splits so the
     centralized baseline sees identical rows and class priors as the federation.
     """
     parts = partition(df, mode, k, alpha, seed)
+    raw_trains = {name: part[part.split == "train"] for name, part in parts.items()}
+    max_tr = max((len(tr) for tr in raw_trains.values()), default=0)
+    keep_frac = (
+        float(train_cap) / float(max_tr)
+        if (train_cap is not None and train_cap > 0 and max_tr > train_cap)
+        else 1.0
+    )
     clients = {}
     for i, (name, part) in enumerate(parts.items()):
-        tr = subsample_train(part[part.split == "train"], train_cap, seed + i)
+        tr_full = raw_trains[name]
+        if keep_frac < 1.0:
+            silo_cap = max(int(round(len(tr_full) * keep_frac)), min(len(tr_full), 2))
+            tr = subsample_train(tr_full, silo_cap, seed + i)
+        else:
+            tr = tr_full
         clients[name] = {
             "train": tr,
             "val": part[part.split == "val"],

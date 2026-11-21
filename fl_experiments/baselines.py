@@ -90,7 +90,7 @@ def _rules_scores(df: pd.DataFrame) -> np.ndarray:
 
 def run_baselines(pooled, clients, model_types, dataset="indofraud",
                   cent_iters=300, cent_epochs=6, local_t0=120, c_fp=7500.0, seed=42,
-                  tree_patience=30, mlp_patience=3, clients_df=None):
+                  tree_patience=80, mlp_patience=3, clients_df=None):
     Xtr = _prep(pooled["train"], dataset)
     Xva = _prep(pooled["val"], dataset)
     Xte = _prep(pooled["test"], dataset)

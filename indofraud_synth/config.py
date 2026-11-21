@@ -1,6 +1,7 @@
 """Generator configuration (dataclasses + YAML loading)."""
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 import yaml
@@ -65,9 +66,9 @@ class SynthConfig:
     horizon_days: int = 180
     start_date: str = "2025-07-01"          # covers 11.11 / 12.12 Harbolnas promos
     base_activity: float = 0.7              # txns / customer / day (mid segment)
-    rails: dict = field(default_factory=lambda: DEFAULT_RAILS.copy())
-    fraud_rates: dict = field(default_factory=lambda: DEFAULT_FRAUD_RATES.copy())
-    typology_mix: dict = field(default_factory=lambda: DEFAULT_TYPOLOGY_MIX.copy())
+    rails: dict = field(default_factory=lambda: copy.deepcopy(DEFAULT_RAILS))
+    fraud_rates: dict = field(default_factory=lambda: copy.deepcopy(DEFAULT_FRAUD_RATES))
+    typology_mix: dict = field(default_factory=lambda: copy.deepcopy(DEFAULT_TYPOLOGY_MIX))
     promo_days: list = field(default_factory=lambda: ["2025-11-11", "2025-12-12"])
     thr_window: Optional[list] = None       # optional ["YYYY-MM-DD", "YYYY-MM-DD"]
     payday_mult: float = 1.6                # gajian uplift (25th..1st)

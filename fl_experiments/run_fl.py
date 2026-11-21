@@ -237,6 +237,8 @@ def _pr_curve_plot(clients, payloads, ensemble_res, pooled, dataset, out_path,
     ref_clients = first_val if is_nested else clients
     silo_order = list(ref_clients.keys())
     y_order = np.concatenate([ref_clients[s].y["test"] for s in silo_order])
+    if len(y_order) == 0 or int(y_order.sum()) == 0:
+        return
 
     fig, ax = plt.subplots(figsize=(7.5, 5.2))
     per_model_scores = {}
@@ -362,6 +364,8 @@ def main():
     else:
         df, cuts = temporal_split(df)
     if args.dataset != "indofraud" and args.partition == "profile":
+        print(f"[warn] --partition profile is only defined for indofraud; "
+              f"switching to dirichlet (alpha={args.alpha}) for {args.dataset}.")
         args.partition = "dirichlet"
     clients_df, pooled = make_clients(df, args.partition, args.k, args.alpha,
                                       args.seed, args.train_cap)
