@@ -66,6 +66,8 @@ def build_run_cmd(args, part_mode: str, part_alpha: float | None,
         cmd += ["--rounds", str(args.rounds)]
     if getattr(args, "split", None):
         cmd += ["--split", args.split]
+    if getattr(args, "train_cap", None) is not None:
+        cmd += ["--train-cap", str(args.train_cap)]
     cmd += ["--partition", part_mode]
     if part_alpha is not None:
         cmd += ["--alpha", str(part_alpha)]
@@ -85,6 +87,7 @@ def main():
     ap.add_argument("--models", default=None)
     ap.add_argument("--k", type=int, default=None)
     ap.add_argument("--rounds", type=int, default=None)
+    ap.add_argument("--train-cap", type=int, default=None)
     ap.add_argument("--split", default=None, choices=["temporal", "random"])
     ap.add_argument("--seeds", default="1,2,3,4,5")
     ap.add_argument("--conditions", default="baseline,normalized,normalized_fedbn")
