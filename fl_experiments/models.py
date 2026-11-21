@@ -21,21 +21,89 @@ XGB_BASE_PARAMS = {
     "seed": 42,
 }
 
+_CUDA_AVAILABLE_CACHE: bool | None = None
+_XGB_CUDA_WORKS: bool | None = None
+
+
+def resolve_device(device: str | None = None) -> str:
+    """Resolve compute device ('cpu' or 'cuda') from arg or INDOFRAUD_DEVICE env."""
+    global _CUDA_AVAILABLE_CACHE
+    req = (device or os.environ.get("INDOFRAUD_DEVICE", "auto")).strip().lower()
+    if req == "cpu":
+        return "cpu"
+    if _CUDA_AVAILABLE_CACHE is None:
+        try:
+            import torch
+            _CUDA_AVAILABLE_CACHE = bool(torch.cuda.is_available())
+        except Exception:
+            _CUDA_AVAILABLE_CACHE = False
+    if req == "cuda":
+        return "cuda" if _CUDA_AVAILABLE_CACHE else "cpu"
+    return "cuda" if _CUDA_AVAILABLE_CACHE else "cpu"
+
+
+def resolve_n_jobs(n_jobs: int | None = None) -> int:
+    """Resolve CPU thread count from arg, INDOFRAUD_N_THREADS env, or os.cpu_count()."""
+    if n_jobs is not None and int(n_jobs) > 0:
+        return int(n_jobs)
+    env = os.environ.get("INDOFRAUD_N_THREADS", "").strip()
+    if env:
+        try:
+            val = int(env)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+    return max(1, os.cpu_count() or 2)
+
+
+def configure_runtime(device: str | None = None, threads: int | None = None) -> tuple[str, int]:
+    """Configure runtime device/threads via env vars so child processes inherit them."""
+    if device is not None:
+        os.environ["INDOFRAUD_DEVICE"] = device.strip().lower()
+    if threads is not None:
+        if int(threads) > 0:
+            os.environ["INDOFRAUD_N_THREADS"] = str(int(threads))
+        else:
+            os.environ.pop("INDOFRAUD_N_THREADS", None)
+    eff_dev = resolve_device()
+    eff_threads = resolve_n_jobs()
+    try:
+        import torch
+        if eff_dev == "cpu":
+            torch.set_num_threads(eff_threads)
+    except Exception:
+        pass
+    return eff_dev, eff_threads
+
 
 def train_xgb(X, y, num_rounds, xgb_model=None, params=None, seed=42,
-              eval_set=None, early_stopping_rounds=None):
+              eval_set=None, early_stopping_rounds=None, dtrain=None):
+    global _XGB_CUDA_WORKS
     import xgboost as xgb
-    p = dict(XGB_BASE_PARAMS); p["seed"] = seed
+    p = dict(XGB_BASE_PARAMS)
+    p["seed"] = seed
+    p["nthread"] = resolve_n_jobs()
     if params:
         p.update(params)
-    dtrain = xgb.DMatrix(X, label=y)
+    want_cuda = ("device" not in p) and (resolve_device() == "cuda") and (_XGB_CUDA_WORKS is not False)
+    if want_cuda:
+        p["device"] = "cuda"
+
+    dm = dtrain if dtrain is not None else xgb.DMatrix(X, label=y)
+    dval = None
+    use_es = False
     if eval_set is not None and early_stopping_rounds:
         Xva, yva = eval_set
         yva_arr = np.asarray(yva)
         if 0 < yva_arr.sum() < len(yva_arr):
             dval = xgb.DMatrix(Xva, label=yva_arr)
+            use_es = True
+
+    def _fit(fit_params):
+        if use_es:
             bst = xgb.train(
-                p, dtrain, num_boost_round=num_rounds, xgb_model=xgb_model,
+                fit_params, dm, num_boost_round=num_rounds, xgb_model=xgb_model,
                 evals=[(dval, "val")], early_stopping_rounds=early_stopping_rounds,
                 verbose_eval=False,
             )
@@ -44,7 +112,19 @@ def train_xgb(X, y, num_rounds, xgb_model=None, params=None, seed=42,
             if best_it is not None and best_it >= 0:
                 bst = bst[: best_it + 1]
             return bst
-    return xgb.train(p, dtrain, num_boost_round=num_rounds, xgb_model=xgb_model)
+        return xgb.train(fit_params, dm, num_boost_round=num_rounds, xgb_model=xgb_model)
+
+    try:
+        bst = _fit(p)
+        if want_cuda:
+            _XGB_CUDA_WORKS = True
+        return bst
+    except xgb.core.XGBoostError:
+        if want_cuda:
+            _XGB_CUDA_WORKS = False
+            p["device"] = "cpu"
+            return _fit(p)
+        raise
 
 
 def xgb_to_bytes(bst) -> bytes:
@@ -55,6 +135,7 @@ def bytes_to_xgb(payload: bytes):
     import xgboost as xgb
     bst = xgb.Booster()
     bst.load_model(bytearray(payload))
+    bst.set_param({"nthread": resolve_n_jobs(), "device": "cpu"})
     return bst
 
 
@@ -64,8 +145,7 @@ def xgb_num_trees(payload: bytes) -> int:
 
 
 def xgb_predict_loaded(bst, X) -> np.ndarray:
-    import xgboost as xgb
-    return bst.predict(xgb.DMatrix(X))
+    return xgb_predict_fast(bst, X)
 
 
 def xgb_predict_fast(bst, X) -> np.ndarray:
@@ -73,7 +153,8 @@ def xgb_predict_fast(bst, X) -> np.ndarray:
     try:
         return np.asarray(bst.inplace_predict(np.asarray(X, dtype=np.float32)), dtype=np.float64)
     except Exception:
-        return xgb_predict_loaded(bst, X)
+        import xgboost as xgb
+        return np.asarray(bst.predict(xgb.DMatrix(X)), dtype=np.float64)
 
 
 def xgb_predict(payload: bytes, X) -> np.ndarray:
@@ -84,7 +165,7 @@ def cat_params(iterations, seed=42):
     return dict(
         loss_function="Logloss", iterations=iterations, depth=6, learning_rate=0.1,
         l2_leaf_reg=5, bootstrap_type="Bernoulli", subsample=0.8,
-        allow_writing_files=False, thread_count=2, verbose=False, random_seed=seed,
+        allow_writing_files=False, thread_count=resolve_n_jobs(), verbose=False, random_seed=seed,
     )
 
 
@@ -191,19 +272,21 @@ def compute_mlp_pos_weight(pos: float, total: float) -> float:
 
 def train_mlp(model, X, y, epochs=2, lr=1e-3, batch_size=1024, prox_mu=0.0,
               ref_arrays=None, seed=42, eval_set=None, patience=None,
-              pos_weight: float | None = None):
+              pos_weight: float | None = None, device: str | None = None):
     import torch
     from .metrics import ap as _ap
     torch.manual_seed(seed)
-    device = "cpu"
-    model = model.to(device).train()
-    Xt = torch.as_tensor(np.array(X, dtype=np.float32, copy=True))
-    yt = torch.as_tensor(np.array(y, dtype=np.float32, copy=True))
+    eff_device = resolve_device(device)
+    if eff_device == "cuda":
+        torch.cuda.manual_seed_all(seed)
+    model = model.to(eff_device).train()
+    Xt = torch.as_tensor(np.ascontiguousarray(X, dtype=np.float32), device=eff_device)
+    yt = torch.as_tensor(np.ascontiguousarray(y, dtype=np.float32), device=eff_device)
     if pos_weight is None:
-        pw_val = compute_mlp_pos_weight(float(yt.sum()), float(len(yt)))
+        pw_val = compute_mlp_pos_weight(float(yt.sum().item()), float(len(yt)))
     else:
         pw_val = max(float(pos_weight), 1.0)
-    pos_weight_t = torch.tensor(pw_val, dtype=torch.float32)
+    pos_weight_t = torch.tensor(pw_val, dtype=torch.float32, device=eff_device)
     loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight_t)
     prior_shift = float(np.log(pw_val))
     opt = torch.optim.Adam(model.parameters(), lr=lr)
@@ -212,7 +295,7 @@ def train_mlp(model, X, y, epochs=2, lr=1e-3, batch_size=1024, prox_mu=0.0,
     ref_map = None
     if prox_mu > 0 and ref_arrays is not None:
         keys = mlp_keys(model)
-        ref_map = {k: torch.as_tensor(np.array(a, dtype=np.float32, copy=True), device=device)
+        ref_map = {k: torch.as_tensor(np.ascontiguousarray(a, dtype=np.float32), device=eff_device)
                    for k, a in zip(keys, ref_arrays)}
     use_es = False
     Xva = yva_arr = None
@@ -223,19 +306,19 @@ def train_mlp(model, X, y, epochs=2, lr=1e-3, batch_size=1024, prox_mu=0.0,
     best_ap, best_arrays, best_epoch = -1.0, None, epochs
     stale = 0
     n = len(Xt)
-    g = torch.Generator().manual_seed(seed)
+    g = torch.Generator(device=eff_device).manual_seed(seed)
     for ep in range(1, epochs + 1):
         model.train()
-        perm = torch.randperm(n, generator=g)
+        perm = torch.randperm(n, generator=g, device=eff_device)
         for i in range(0, n, batch_size):
             idx = perm[i:i + batch_size]
             if len(idx) < 2:      # BatchNorm needs >=2 samples
                 continue
-            opt.zero_grad()
+            opt.zero_grad(set_to_none=True)
             out = model(Xt[idx])
             loss = loss_fn(out, yt[idx])
             if ref_map is not None:
-                prox = torch.zeros((), dtype=torch.float32, device=device)
+                prox = torch.zeros((), dtype=torch.float32, device=eff_device)
                 for name, p in model.named_parameters():
                     r = ref_map.get(name)
                     if r is not None and p.shape == r.shape:
@@ -254,6 +337,7 @@ def train_mlp(model, X, y, epochs=2, lr=1e-3, batch_size=1024, prox_mu=0.0,
                 stale += 1
                 if patience is not None and stale >= patience:
                     break
+    model = model.to("cpu")
     if use_es and best_arrays is not None:
         mlp_from_arrays(model, best_arrays)
     model.best_epoch_ = best_epoch
@@ -265,15 +349,32 @@ def mlp_predict(model, X, batch_size=4096, logit_shift: float | None = None):
     """Predict fraud probabilities, analytically correcting for training `pos_weight`
     logit shift (`z_corr = z - log(pos_weight)`) so outputs sit on the true posterior scale."""
     import torch
+    n = len(X)
+    if n == 0:
+        return np.zeros(0)
+    orig_dev = next(model.parameters()).device
+    use_cuda = (orig_dev.type == "cuda") or (n >= 8192 and resolve_device() == "cuda")
+    run_dev = torch.device("cuda") if use_cuda else torch.device("cpu")
+    eff_bs = max(batch_size, 16384) if run_dev.type == "cuda" else batch_size
+    moved = run_dev != orig_dev
+    if moved:
+        model = model.to(run_dev)
     model = model.eval()
     shift = (float(logit_shift) if logit_shift is not None
              else float(getattr(model, "prior_logit_shift_", 0.0)))
     outs = []
-    with torch.no_grad():
-        Xt = torch.as_tensor(X, dtype=torch.float32)
-        for i in range(0, len(Xt), batch_size):
-            logits = model(Xt[i:i + batch_size])
-            if shift != 0.0:
-                logits = logits - shift
-            outs.append(torch.sigmoid(logits).numpy())
+    try:
+        with torch.no_grad():
+            Xt = torch.as_tensor(np.ascontiguousarray(X, dtype=np.float32))
+            for i in range(0, n, eff_bs):
+                xb = Xt[i:i + eff_bs]
+                if run_dev.type == "cuda":
+                    xb = xb.to(run_dev, non_blocking=True)
+                logits = model(xb)
+                if shift != 0.0:
+                    logits = logits - shift
+                outs.append(torch.sigmoid(logits).cpu().numpy())
+    finally:
+        if moved:
+            model.to(orig_dev)
     return np.concatenate(outs) if outs else np.zeros(0)

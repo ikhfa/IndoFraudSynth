@@ -131,8 +131,9 @@ def _shrink_platt(cal: PlattCalibrator, global_ab: tuple[float, float] | None,
     )
 
 
-def gather_scores(clients, payloads, split):
+def gather_scores(clients, payloads, split, loaded_models: dict | None = None):
     """{model: {silo: scores}} for clients that have a trained payload."""
+    from . import models as M
     first_val = next(iter(clients.values()))
     is_nested = isinstance(first_val, dict)
     out = {}
@@ -140,7 +141,15 @@ def gather_scores(clients, payloads, split):
         if payload is None:
             continue
         cmap = clients[mt] if is_nested else clients
-        out[mt] = {name: c.predict(payload, split) for name, c in cmap.items()}
+        loaded = None
+        if loaded_models is not None and mt in loaded_models:
+            loaded = loaded_models[mt]
+        elif mt == "xgboost":
+            loaded = M.bytes_to_xgb(payload)
+        elif mt == "catboost":
+            loaded = M.bytes_to_cat(payload)
+        out[mt] = {name: c.predict(payload, split, loaded_model=loaded)
+                   for name, c in cmap.items()}
     return out
 
 
@@ -328,10 +337,19 @@ def _eval_variant(test_scores, clients, thr_map, c_fp, use_bayes=False,
 
 def evaluate_ensemble(clients, payloads, c_fp=7500.0, seed=42, n_draws=300,
                       out_plot_scores: dict | None = None):
+    from . import models as M
     first_val = next(iter(clients.values()))
     ref_clients = first_val if isinstance(first_val, dict) else clients
-    val_scores = gather_scores(clients, payloads, "val")
-    test_scores = gather_scores(clients, payloads, "test")
+    loaded_models = {}
+    for mt, payload in payloads.items():
+        if payload is None:
+            continue
+        if mt == "xgboost":
+            loaded_models[mt] = M.bytes_to_xgb(payload)
+        elif mt == "catboost":
+            loaded_models[mt] = M.bytes_to_cat(payload)
+    val_scores = gather_scores(clients, payloads, "val", loaded_models=loaded_models)
+    test_scores = gather_scores(clients, payloads, "test", loaded_models=loaded_models)
     y_vals = {s: c.y["val"] for s, c in ref_clients.items()}
     models = list(payloads.keys())
 

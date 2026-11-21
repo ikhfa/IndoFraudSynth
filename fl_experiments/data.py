@@ -1,6 +1,8 @@
 """Dataset loading, temporal splits, client partitioning, train subsampling."""
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
 import os
 
@@ -9,9 +11,55 @@ import pandas as pd
 
 from indofraud_synth.silos import partition
 
+_HAS_PARQUET = (
+    importlib.util.find_spec("pyarrow") is not None
+    or importlib.util.find_spec("fastparquet") is not None
+)
+
+
+def _parquet_cache_path(default_path: str, source_paths: list[str]) -> str:
+    """Resolve parquet cache path, falling back to INDOFRAUD_DATA_CACHE for read-only inputs."""
+    env_dir = os.environ.get("INDOFRAUD_DATA_CACHE", "").strip()
+    parent = os.path.dirname(os.path.abspath(default_path))
+    if os.access(parent, os.W_OK):
+        return default_path
+    if env_dir:
+        os.makedirs(env_dir, exist_ok=True)
+        h = hashlib.sha256("|".join(os.path.abspath(p) for p in source_paths).encode()).hexdigest()[:12]
+        return os.path.join(env_dir, f"{os.path.splitext(os.path.basename(default_path))[0]}_{h}.parquet")
+    return default_path
+
+
+def _load_or_cache_parquet(default_cache: str, source_paths: list[str],
+                           loader_fn, min_bytes: int = 5_000_000) -> pd.DataFrame:
+    """Load preprocessed DataFrame from Parquet cache when fresh; auto-create for large CSVs."""
+    if not _HAS_PARQUET or os.environ.get("INDOFRAUD_NO_PARQUET_CACHE") == "1":
+        return loader_fn()
+    existing_sources = [p for p in source_paths if p and os.path.exists(p)]
+    total_bytes = sum(os.path.getsize(p) for p in existing_sources)
+    if total_bytes < min_bytes:
+        return loader_fn()
+    cache_path = _parquet_cache_path(default_cache, existing_sources)
+    src_mtime = max((os.path.getmtime(p) for p in existing_sources), default=0.0)
+    if os.path.exists(cache_path) and os.path.getmtime(cache_path) >= src_mtime:
+        try:
+            return pd.read_parquet(cache_path)
+        except Exception:
+            pass
+    df = loader_fn()
+    try:
+        tmp = f"{cache_path}.{os.getpid()}.tmp"
+        df.to_parquet(tmp, index=False)
+        os.replace(tmp, cache_path)
+    except Exception:
+        pass
+    return df
+
 
 def load_indofraud(data_dir: str) -> pd.DataFrame:
-    tx = pd.read_csv(os.path.join(data_dir, "transactions.csv.gz"))
+    csv_path = os.path.join(data_dir, "transactions.csv.gz")
+    pq_path = os.path.join(data_dir, "transactions.parquet")
+    tx = _load_or_cache_parquet(pq_path, [csv_path], lambda: pd.read_csv(csv_path))
     with open(os.path.join(data_dir, "meta.json")) as f:
         meta = json.load(f)
     tx.attrs["rail_names"] = meta["rail_names"]
@@ -25,15 +73,20 @@ def load_ulb(csv_path: str) -> pd.DataFrame:
     Download manually from https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud
     and pass the path to creditcard.csv.
     """
-    df = pd.read_csv(csv_path)
-    df = df.rename(columns={"Class": "is_fraud"})
-    df["is_fraud"] = df["is_fraud"].astype(np.int8)
-    df["ts"] = df["Time"].astype(np.int64)
-    df["amount"] = df["Amount"].astype(np.float64)
-    df["Amount_log"] = np.log1p(np.maximum(df["amount"], 0.0))
-    df["hour"] = ((df["ts"] // 3600) % 24).astype(np.int8)
-    df["silo_id"] = 0
-    df = df.sort_values("ts", kind="stable").reset_index(drop=True)
+    def _load():
+        df = pd.read_csv(csv_path)
+        df = df.rename(columns={"Class": "is_fraud"})
+        df["is_fraud"] = df["is_fraud"].astype(np.int8)
+        df["ts"] = df["Time"].astype(np.int64)
+        df["amount"] = df["Amount"].astype(np.float64)
+        df["Amount_log"] = np.log1p(np.maximum(df["amount"], 0.0))
+        df["hour"] = ((df["ts"] // 3600) % 24).astype(np.int8)
+        df["silo_id"] = 0
+        df = df.sort_values("ts", kind="stable").reset_index(drop=True)
+        return df
+
+    cache_path = os.path.join(os.path.dirname(os.path.abspath(csv_path)), ".cache_ulb.parquet")
+    df = _load_or_cache_parquet(cache_path, [csv_path], _load)
     df.attrs["silo_names"] = ["pooled"]
     return df
 
@@ -85,43 +138,49 @@ def load_ieee_cis(path: str) -> pd.DataFrame:
             "https://www.kaggle.com/c/ieee-fraud-detection"
         )
 
-    df = pd.read_csv(tx_path)
-    if os.path.exists(id_path):
-        ident = pd.read_csv(id_path)
-        df = df.merge(ident, on="TransactionID", how="left")
-        del ident
+    def _load():
+        df = pd.read_csv(tx_path)
+        if os.path.exists(id_path):
+            ident = pd.read_csv(id_path)
+            df = df.merge(ident, on="TransactionID", how="left")
+            del ident
 
-    ts_arr = df["TransactionDT"].to_numpy(np.int64)
-    amt_arr = df["TransactionAmt"].to_numpy(np.float64)
-    extra = pd.DataFrame({
-        "is_fraud": df["isFraud"].to_numpy(np.int8),
-        "ts": ts_arr,
-        "amount": amt_arr,
-        "amount_log": np.log1p(np.maximum(amt_arr, 0.0)).astype(np.float32),
-        "hour": ((ts_arr // 3600) % 24).astype(np.int8),
-        "dow": ((ts_arr // 86400) % 7).astype(np.int8),
-        "silo_id": np.zeros(len(df), dtype=np.int8),
-    }, index=df.index)
+        ts_arr = df["TransactionDT"].to_numpy(np.int64)
+        amt_arr = df["TransactionAmt"].to_numpy(np.float64)
+        extra = pd.DataFrame({
+            "is_fraud": df["isFraud"].to_numpy(np.int8),
+            "ts": ts_arr,
+            "amount": amt_arr,
+            "amount_log": np.log1p(np.maximum(amt_arr, 0.0)).astype(np.float32),
+            "hour": ((ts_arr // 3600) % 24).astype(np.int8),
+            "dow": ((ts_arr // 86400) % 7).astype(np.int8),
+            "silo_id": np.zeros(len(df), dtype=np.int8),
+        }, index=df.index)
 
-    drop_cols = [c for c in ("TransactionID", "isFraud", "TransactionDT") if c in df.columns]
-    df = df.drop(columns=drop_cols)
-    # Downcast wide IEEE-CIS float64 columns to float32 before concat/sort to halve RAM
-    f64_cols = df.select_dtypes(include=["float64"]).columns
-    if len(f64_cols):
-        df[f64_cols] = df[f64_cols].astype(np.float32)
-    i64_cols = df.select_dtypes(include=["int64"]).columns
-    if len(i64_cols):
-        df[i64_cols] = df[i64_cols].astype(np.int32)
-    df = pd.concat([df, extra], axis=1)
-    del extra
+        drop_cols = [c for c in ("TransactionID", "isFraud", "TransactionDT") if c in df.columns]
+        df = df.drop(columns=drop_cols)
+        # Downcast wide IEEE-CIS float64 columns to float32 before concat/sort to halve RAM
+        f64_cols = df.select_dtypes(include=["float64"]).columns
+        if len(f64_cols):
+            df[f64_cols] = df[f64_cols].astype(np.float32)
+        i64_cols = df.select_dtypes(include=["int64"]).columns
+        if len(i64_cols):
+            df[i64_cols] = df[i64_cols].astype(np.int32)
+        df = pd.concat([df, extra], axis=1)
+        del extra
 
-    df = df.sort_values("ts", kind="stable").reset_index(drop=True)
-    obj_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
-    df = _encode_object_cols(df, obj_cols, fit_prefix_frac=0.7)
-    for c in df.select_dtypes(include=[np.floating]).columns:
-        arr = df[c].to_numpy(copy=False)
-        if np.isinf(arr).any():
-            df[c] = np.where(np.isinf(arr), np.nan, arr).astype(arr.dtype, copy=False)
+        df = df.sort_values("ts", kind="stable").reset_index(drop=True)
+        obj_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
+        df = _encode_object_cols(df, obj_cols, fit_prefix_frac=0.7)
+        for c in df.select_dtypes(include=[np.floating]).columns:
+            arr = df[c].to_numpy(copy=False)
+            if np.isinf(arr).any():
+                df[c] = np.where(np.isinf(arr), np.nan, arr).astype(arr.dtype, copy=False)
+        return df
+
+    src_files = [tx_path] + ([id_path] if os.path.exists(id_path) else [])
+    cache_path = os.path.join(os.path.dirname(os.path.abspath(tx_path)), ".cache_ieee_cis.parquet")
+    df = _load_or_cache_parquet(cache_path, src_files, _load)
     df.attrs["silo_names"] = ["pooled"]
     return df
 
@@ -151,55 +210,62 @@ def load_sparkov(path: str) -> pd.DataFrame:
                 f"Sparkov file not found at {tr_path}. Download fraudTrain.csv / "
                 "fraudTest.csv from https://www.kaggle.com/datasets/kartik2112/fraud-detection"
             )
-        frames = [pd.read_csv(tr_path)]
-        if os.path.exists(te_path):
-            frames.append(pd.read_csv(te_path))
-        df = pd.concat(frames, ignore_index=True)
+        src_files = [tr_path] + ([te_path] if os.path.exists(te_path) else [])
+        cache_dir = os.path.abspath(path)
     else:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Sparkov CSV not found at {path}")
-        df = pd.read_csv(path)
+        src_files = [path]
+        cache_dir = os.path.dirname(os.path.abspath(path))
 
-    df["is_fraud"] = df["is_fraud"].astype(np.int8)
-    if "unix_time" in df.columns:
-        df["ts"] = df["unix_time"].astype(np.int64)
-        dt = pd.to_datetime(df["ts"], unit="s")
-    else:
-        dt = pd.to_datetime(df["trans_date_trans_time"])
-        df["ts"] = (dt.astype("int64") // 10**9).astype(np.int64)
+    def _load():
+        frames = [pd.read_csv(p) for p in src_files]
+        df = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
 
-    df["amount"] = df["amt"].astype(np.float64)
-    df["amount_log"] = np.log1p(np.maximum(df["amount"], 0.0))
-    df["hour"] = dt.dt.hour.astype(np.int8)
-    df["dow"] = dt.dt.day_of_week.astype(np.int8)
-    df["is_night"] = (df["hour"] < 6).astype(np.int8)
-    if "city_pop" in df.columns:
-        df["city_pop_log"] = np.log1p(np.maximum(df["city_pop"].astype(np.float64), 0.0))
-    if "dob" in df.columns:
-        dob = pd.to_datetime(df["dob"], errors="coerce")
-        df["age_years"] = ((dt - dob).dt.days / 365.25).astype(np.float64)
-    if {"lat", "long", "merch_lat", "merch_long"} <= set(df.columns):
-        df["geo_dist_km"] = _haversine_km(
-            df["lat"].to_numpy(np.float64), df["long"].to_numpy(np.float64),
-            df["merch_lat"].to_numpy(np.float64), df["merch_long"].to_numpy(np.float64),
-        )
+        df["is_fraud"] = df["is_fraud"].astype(np.int8)
+        if "unix_time" in df.columns:
+            df["ts"] = df["unix_time"].astype(np.int64)
+            dt = pd.to_datetime(df["ts"], unit="s")
+        else:
+            dt = pd.to_datetime(df["trans_date_trans_time"])
+            df["ts"] = (dt.astype("int64") // 10**9).astype(np.int64)
 
-    df["silo_id"] = 0
-    # Drop raw PII / high-cardinality identifiers (and arbitrary postal code `zip`,
-    # since `lat`/`long`/`geo_dist_km`/`city_pop_log` capture geography cleanly).
-    pii_drop = [
-        "Unnamed: 0", "trans_date_trans_time", "cc_num", "merchant",
-        "first", "last", "street", "city", "zip", "trans_num", "dob", "unix_time",
-    ]
-    df = df.drop(columns=[c for c in pii_drop if c in df.columns])
+        df["amount"] = df["amt"].astype(np.float64)
+        df["amount_log"] = np.log1p(np.maximum(df["amount"], 0.0))
+        df["hour"] = dt.dt.hour.astype(np.int8)
+        df["dow"] = dt.dt.day_of_week.astype(np.int8)
+        df["is_night"] = (df["hour"] < 6).astype(np.int8)
+        if "city_pop" in df.columns:
+            df["city_pop_log"] = np.log1p(np.maximum(df["city_pop"].astype(np.float64), 0.0))
+        if "dob" in df.columns:
+            dob = pd.to_datetime(df["dob"], errors="coerce")
+            df["age_years"] = ((dt - dob).dt.days / 365.25).astype(np.float64)
+        if {"lat", "long", "merch_lat", "merch_long"} <= set(df.columns):
+            df["geo_dist_km"] = _haversine_km(
+                df["lat"].to_numpy(np.float64), df["long"].to_numpy(np.float64),
+                df["merch_lat"].to_numpy(np.float64), df["merch_long"].to_numpy(np.float64),
+            )
 
-    df = df.sort_values("ts", kind="stable").reset_index(drop=True)
-    obj_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
-    df = _encode_object_cols(df, obj_cols, fit_prefix_frac=0.7)
-    for c in df.select_dtypes(include=[np.floating]).columns:
-        arr = df[c].to_numpy(copy=False)
-        if np.isinf(arr).any():
-            df[c] = np.where(np.isinf(arr), np.nan, arr).astype(arr.dtype, copy=False)
+        df["silo_id"] = 0
+        # Drop raw PII / high-cardinality identifiers (and arbitrary postal code `zip`,
+        # since `lat`/`long`/`geo_dist_km`/`city_pop_log` capture geography cleanly).
+        pii_drop = [
+            "Unnamed: 0", "trans_date_trans_time", "cc_num", "merchant",
+            "first", "last", "street", "city", "zip", "trans_num", "dob", "unix_time",
+        ]
+        df = df.drop(columns=[c for c in pii_drop if c in df.columns])
+
+        df = df.sort_values("ts", kind="stable").reset_index(drop=True)
+        obj_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
+        df = _encode_object_cols(df, obj_cols, fit_prefix_frac=0.7)
+        for c in df.select_dtypes(include=[np.floating]).columns:
+            arr = df[c].to_numpy(copy=False)
+            if np.isinf(arr).any():
+                df[c] = np.where(np.isinf(arr), np.nan, arr).astype(arr.dtype, copy=False)
+        return df
+
+    cache_path = os.path.join(cache_dir, ".cache_sparkov.parquet")
+    df = _load_or_cache_parquet(cache_path, src_files, _load)
     df.attrs["silo_names"] = ["pooled"]
     return df
 

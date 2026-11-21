@@ -24,6 +24,7 @@ class ClientCfg:
     local_iters: int = 15      # new trees per round (t > 1)
     mlp_epochs: int = 2
     mlp_lr: float = 1e-3
+    mlp_batch_size: int = 1024
     mlp_pos_weight: float | None = None  # FL-safe global sqrt(neg/pos) weight
     prox_mu: float = 0.0       # >0 enables FedProx
     mlp_agg: str = "fedavg"    # fedavg | fedprox | fedbn
@@ -65,6 +66,16 @@ class FraudClient:
         self.bn_history: dict[int, dict[int, np.ndarray]] = {}  # round -> BN slots
         self.active_bn_round: int | None = None  # pinned BN round for best_round eval
         self.keys = M.mlp_keys(M.make_mlp(self.in_dim)) if model_type == "mlp" else None
+        self._xgb_dtrain = None  # lazily cached xgboost.DMatrix (omitted on pickle)
+
+    def __getstate__(self):
+        st = self.__dict__.copy()
+        st["_xgb_dtrain"] = None
+        return st
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._xgb_dtrain = None
 
     # ---------- FedBN state persistence (survives Ray worker serialization) ----------
     def _bn_safe_name(self) -> str:
@@ -149,7 +160,8 @@ class FraudClient:
 
     # ---------- core FL API ----------
     def fit(self, payload, server_round: int, t0_override: int | None = None,
-            local_iters_override: int | None = None, n_prev: int = 0):
+            local_iters_override: int | None = None, n_prev: int = 0,
+            init_model_path: str | None = None):
         cfg = self.cfg
         r1_iters = t0_override if t0_override is not None else cfg.t0
         round_iters = (local_iters_override if local_iters_override is not None
@@ -157,13 +169,18 @@ class FraudClient:
         if self.model_type == "xgboost":
             if len(self.y["train"]) == 0:
                 return b"", 0, {"n_trees": 0, "payload_bytes": 0}
+            if self._xgb_dtrain is None:
+                import xgboost as xgb
+                self._xgb_dtrain = xgb.DMatrix(self.X["train"], label=self.y["train"])
             if server_round == 1 or payload is None:
-                bst = M.train_xgb(self.X["train"], self.y["train"], r1_iters, seed=cfg.seed)
+                bst = M.train_xgb(self.X["train"], self.y["train"], r1_iters,
+                                  seed=cfg.seed, dtrain=self._xgb_dtrain)
                 out = M.xgb_to_bytes(bst)
             else:
                 g = M.bytes_to_xgb(payload)
                 bst = M.train_xgb(self.X["train"], self.y["train"], round_iters,
-                                  xgb_model=g, seed=cfg.seed + server_round)
+                                  xgb_model=g, seed=cfg.seed + server_round,
+                                  dtrain=self._xgb_dtrain)
                 full_out = M.xgb_to_bytes(bst)
                 out = extract_xgb_delta(full_out, n_prev) if n_prev > 0 else full_out
             n_up = M.xgb_num_trees(out) if out else 0
@@ -179,6 +196,12 @@ class FraudClient:
             if server_round == 1 or payload is None:
                 model = M.train_cat(self.X["train"], y_tr, r1_iters, seed=cfg.seed)
                 out = M.cat_to_bytes(model)
+            elif init_model_path is not None and os.path.exists(init_model_path):
+                model = M.train_cat(self.X["train"], y_tr, round_iters,
+                                    init_model_path=init_model_path,
+                                    seed=cfg.seed + server_round)
+                full_out = M.cat_to_bytes(model)
+                out = extract_cat_delta(full_out, n_prev) if n_prev > 0 else full_out
             else:
                 with tempfile.TemporaryDirectory() as td:
                     p = os.path.join(td, "global.cbm")
@@ -202,7 +225,8 @@ class FraudClient:
             mu = cfg.prox_mu if cfg.mlp_agg == "fedprox" else 0.0
             if len(self.y["train"]) >= 2:
                 model = M.train_mlp(model, self.X["train"], self.y["train"],
-                                    epochs=cfg.mlp_epochs, lr=cfg.mlp_lr, prox_mu=mu,
+                                    epochs=cfg.mlp_epochs, lr=cfg.mlp_lr,
+                                    batch_size=cfg.mlp_batch_size, prox_mu=mu,
                                     ref_arrays=ref, seed=cfg.seed + server_round,
                                     pos_weight=cfg.mlp_pos_weight)
             arrays = M.mlp_to_arrays(model)
@@ -222,15 +246,19 @@ class FraudClient:
             pw = M.compute_mlp_pos_weight(float(y_tr.sum()), float(len(y_tr))) if len(y_tr) else 1.0
         return float(np.log(pw))
 
-    def predict(self, payload, split="val", bn_round: int | None = None):
+    def predict(self, payload, split="val", bn_round: int | None = None, loaded_model=None):
         if self.model_type == "xgboost":
+            if loaded_model is not None:
+                return M.xgb_predict_fast(loaded_model, self.X[split])
             return M.xgb_predict(payload, self.X[split])
         if self.model_type == "catboost":
+            if loaded_model is not None:
+                return M.cat_predict_loaded(loaded_model, self.X[split])
             return M.cat_predict(payload, self.X[split])
         model = self._mlp_model_from(payload, bn_round=bn_round)
         return M.mlp_predict(model, self.X[split], logit_shift=self._mlp_logit_shift())
 
-    def evaluate(self, payload, server_round: int | None = None):
+    def evaluate(self, payload, server_round: int | None = None, loaded_model=None):
         y_val = self.y["val"]
         has_pos = bool(len(y_val) > 0 and 0 < y_val.sum() < len(y_val))
         if not has_pos:
@@ -239,7 +267,7 @@ class FraudClient:
                 "has_pos": 0.0,
                 "recall_at_fpr_001": -1.0,
             }
-        s = self.predict(payload, "val", bn_round=server_round)
+        s = self.predict(payload, "val", bn_round=server_round, loaded_model=loaded_model)
         a = ap(y_val, s)
         if np.isnan(a):
             return 1.0, len(y_val), {

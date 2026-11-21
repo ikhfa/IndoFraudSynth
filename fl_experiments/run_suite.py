@@ -15,6 +15,8 @@ Example (full publication matrix):
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
 import os
 import subprocess
 import sys
@@ -46,7 +48,7 @@ def parse_partition_spec(spec: str) -> tuple[str, str, float | None]:
 
 def build_run_cmd(args, part_mode: str, part_alpha: float | None,
                   condition: str, seed: int, run_dir: str,
-                  run_baselines: bool) -> list[str]:
+                  run_baselines: bool, model_cache_dir: str | None = None) -> list[str]:
     if condition not in CONDITION_PRESETS:
         raise ValueError(f"Unknown condition '{condition}'. Choose from {sorted(CONDITION_PRESETS)}")
     cmd = [sys.executable, "-m", "fl_experiments.run_fl"]
@@ -64,10 +66,20 @@ def build_run_cmd(args, part_mode: str, part_alpha: float | None,
         cmd += ["--k", str(args.k)]
     if args.rounds is not None:
         cmd += ["--rounds", str(args.rounds)]
+    if getattr(args, "patience", None) is not None:
+        cmd += ["--patience", str(args.patience)]
     if getattr(args, "split", None):
         cmd += ["--split", args.split]
     if getattr(args, "train_cap", None) is not None:
         cmd += ["--train-cap", str(args.train_cap)]
+    if getattr(args, "device", None):
+        cmd += ["--device", args.device]
+    if getattr(args, "threads", None) is not None:
+        cmd += ["--threads", str(args.threads)]
+    if getattr(args, "mlp_batch_size", None) is not None:
+        cmd += ["--mlp-batch-size", str(args.mlp_batch_size)]
+    if model_cache_dir:
+        cmd += ["--model-cache-dir", model_cache_dir]
     cmd += ["--partition", part_mode]
     if part_alpha is not None:
         cmd += ["--alpha", str(part_alpha)]
@@ -87,8 +99,17 @@ def main():
     ap.add_argument("--models", default=None)
     ap.add_argument("--k", type=int, default=None)
     ap.add_argument("--rounds", type=int, default=None)
+    ap.add_argument("--patience", type=int, default=None)
     ap.add_argument("--train-cap", type=int, default=None)
     ap.add_argument("--split", default=None, choices=["temporal", "random"])
+    ap.add_argument("--device", default=None, choices=["auto", "cpu", "cuda"])
+    ap.add_argument("--threads", type=int, default=None,
+                    help="Threads per worker process (default: auto; auto-divided if --workers > 1)")
+    ap.add_argument("--mlp-batch-size", type=int, default=None)
+    ap.add_argument("--workers", type=int, default=1,
+                    help="Number of seeds to run concurrently (keep 1 when using a single GPU)")
+    ap.add_argument("--no-model-cache", action="store_true",
+                    help="Disable cross-condition FL model payload caching")
     ap.add_argument("--seeds", default="1,2,3,4,5")
     ap.add_argument("--conditions", default="baseline,normalized,normalized_fedbn")
     ap.add_argument("--partitions", default="profile",
@@ -103,42 +124,59 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="Print commands without executing")
     args = ap.parse_args()
 
+    # If parallel seed workers are requested on CPU without explicit --threads,
+    # divide CPU cores evenly across workers to prevent thread oversubscription.
+    if args.workers > 1 and args.threads is None:
+        args.threads = max(1, (os.cpu_count() or 2) // args.workers)
+
     seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
     conditions = [c.strip() for c in args.conditions.split(",") if c.strip()]
     part_specs = [parse_partition_spec(p) for p in args.partitions.split(",") if p.strip()]
 
+    def _run_seed(part_dir: str, pmode: str, palpha: float | None, seed: int,
+                  model_cache_dir: str | None):
+        has_baselines_for_seed = False
+        if args.skip_existing:
+            for prev_cond in conditions:
+                prev_path = os.path.join(part_dir, prev_cond, f"seed_{seed}", "results.json")
+                if os.path.exists(prev_path):
+                    try:
+                        with open(prev_path) as f:
+                            if "baselines" in json.load(f):
+                                has_baselines_for_seed = True
+                                break
+                    except Exception:
+                        pass
+        for cond in conditions:
+            run_dir = os.path.join(part_dir, cond, f"seed_{seed}")
+            res_path = os.path.join(run_dir, "results.json")
+            if args.skip_existing and os.path.exists(res_path):
+                print(f"[skip] {res_path}")
+                continue
+            # Compute centralized + local-only baselines once per (partition, seed)
+            need_base = not has_baselines_for_seed
+            cmd = build_run_cmd(args, pmode, palpha, cond, seed, run_dir,
+                                run_baselines=need_base, model_cache_dir=model_cache_dir)
+            print("[run]", " ".join(cmd), flush=True)
+            if not args.dry_run:
+                subprocess.run(cmd, check=True)
+                if need_base:
+                    has_baselines_for_seed = True
+
     for ptag, pmode, palpha in part_specs:
         part_dir = os.path.join(args.out, ptag)
         os.makedirs(part_dir, exist_ok=True)
-        for seed in seeds:
-            has_baselines_for_seed = False
-            if args.skip_existing:
-                import json
-                for prev_cond in conditions:
-                    prev_path = os.path.join(part_dir, prev_cond, f"seed_{seed}", "results.json")
-                    if os.path.exists(prev_path):
-                        try:
-                            with open(prev_path) as f:
-                                if "baselines" in json.load(f):
-                                    has_baselines_for_seed = True
-                                    break
-                        except Exception:
-                            pass
-            for c_idx, cond in enumerate(conditions):
-                run_dir = os.path.join(part_dir, cond, f"seed_{seed}")
-                res_path = os.path.join(run_dir, "results.json")
-                if args.skip_existing and os.path.exists(res_path):
-                    print(f"[skip] {res_path}")
-                    continue
-                # Compute centralized + local-only baselines once per (partition, seed)
-                need_base = not has_baselines_for_seed
-                cmd = build_run_cmd(args, pmode, palpha, cond, seed, run_dir,
-                                    run_baselines=need_base)
-                print("[run]", " ".join(cmd))
-                if not args.dry_run:
-                    subprocess.run(cmd, check=True)
-                    if need_base:
-                        has_baselines_for_seed = True
+        model_cache_dir = (None if args.no_model_cache
+                           else os.path.join(part_dir, "_model_cache"))
+        if args.workers > 1 and not args.dry_run and len(seeds) > 1:
+            with ThreadPoolExecutor(max_workers=args.workers) as pool:
+                futs = [pool.submit(_run_seed, part_dir, pmode, palpha, seed, model_cache_dir)
+                        for seed in seeds]
+                for fut in as_completed(futs):
+                    fut.result()
+        else:
+            for seed in seeds:
+                _run_seed(part_dir, pmode, palpha, seed, model_cache_dir)
 
         if not args.dry_run:
             runs = load_suite_dir(part_dir)

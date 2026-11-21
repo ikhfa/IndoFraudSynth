@@ -15,7 +15,9 @@ build/
 data/
 results/
 _bn_state/
+_model_cache/
 *.csv.gz
+*.parquet
 *.cbm
 *.npz
 

@@ -61,18 +61,24 @@ IndoFraudSynth/
 
 ## Setup
 
-Python 3.11+ is recommended.
+Python 3.11+ is recommended. Using [`uv`](https://docs.astral.sh/uv/) is the fastest way to create and populate the environment:
 
 ```bash
-python -m venv .venv
+# Install uv if needed:
+#   Linux/macOS: curl -LsSf https://astral.sh/uv/install.sh | sh
+#   Windows:     powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+uv venv .venv --python 3.11
 # Windows PowerShell:
 .\.venv\Scripts\Activate.ps1
 # Linux / macOS:
 # source .venv/bin/activate
 
-pip install -r requirements.txt
+uv pip install -r requirements.txt
+# Optional: install pyarrow for automatic fast Parquet dataset caching
+uv pip install pyarrow
 # Optional: install Ray for multi-process Flower simulation
-# pip install "flwr[simulation]"
+# uv pip install "flwr[simulation]"
 ```
 
 Run the test suite to verify the installation:
@@ -80,6 +86,22 @@ Run the test suite to verify the installation:
 ```bash
 python -m pytest -v
 ```
+
+---
+
+## Fast Execution (GPU, Multi-Core CPU, Google Colab & Kaggle)
+
+The runner automatically accelerates experiments without altering methodology:
+
+- **Auto GPU detection (`--device auto`):** Uses CUDA automatically for PyTorch MLP and XGBoost (`tree_method=hist, device=cuda`) whenever a GPU is available, and uses all CPU cores (`--threads 0`) for CatBoost and CPU runs.
+- **Cross-condition model caching:** `run_suite.py` automatically caches trained per-model FL payloads in `<partition>/_model_cache/` so identical XGBoost/CatBoost/MLP runs shared across ablation conditions (`normalized`, `normalized_fedprox`, `normalized_fedbn`, `normalized_size_fedbn`) are trained once per seed (~40% fewer FL trainings with bit-for-bit identical outputs). Pass `--no-model-cache` to disable.
+- **Automatic Parquet caching:** Large CSVs (`transactions.csv.gz`, IEEE-CIS, Sparkov, ULB) are cached to `.parquet` on first load when `pyarrow` is installed (~2s reload vs. ~35s CSV parse). Set `INDOFRAUD_DATA_CACHE=/writable/dir` when inputs live on read-only mounts (e.g. `/kaggle/input`).
+- **Parallel seed workers (multi-core CPU):** Pass `--workers 2` to `run_suite.py` to run seeds concurrently (threads per worker are auto-divided). Keep `--workers 1` on a single GPU.
+
+### Cloud Notebooks (Ready-to-Run with `uv`)
+
+- **Google Colab:** [`notebooks/colab_runner.ipynb`](notebooks/colab_runner.ipynb) — installs dependencies via `uv pip install --system` while preserving Colab's CUDA PyTorch, caches Parquet data on Google Drive, and writes results directly to Drive with `--skip-existing` for disconnect-safe resumption.
+- **Kaggle (Free 30 GB RAM + `GPU T4 x2` / `P100`):** [`notebooks/kaggle_runner.ipynb`](notebooks/kaggle_runner.ipynb) — auto-discovers attached Kaggle public datasets (ULB, IEEE-CIS, Sparkov), supports resuming from previous notebook outputs, and includes a **Dual-GPU (`T4 x2`) parallel sharding cell** that splits seeds across GPU 0 and GPU 1 simultaneously.
 
 ---
 

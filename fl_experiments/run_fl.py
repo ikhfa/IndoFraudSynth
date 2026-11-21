@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 import shutil
@@ -57,15 +58,32 @@ def run_local_engine(cores, model_type, rounds, normalize, budget,
     )
     for r in range(1, rounds + 1):
         t0 = time.perf_counter()
-        fits = [
-            c.fit(
-                payload, r,
-                t0_override=(r1_t0 if r == 1 else None),
-                local_iters_override=(eff_local_iters if r > 1 else None),
-                n_prev=(n_prev if model_type != "mlp" else 0),
-            )
-            for c in cores
-        ]
+        if model_type == "catboost" and r > 1 and payload is not None:
+            # Write global.cbm once per round instead of once per client.
+            with tempfile.TemporaryDirectory() as td:
+                cbm_path = os.path.join(td, "global.cbm")
+                with open(cbm_path, "wb") as f:
+                    f.write(payload)
+                fits = [
+                    c.fit(
+                        payload, r,
+                        t0_override=None,
+                        local_iters_override=eff_local_iters,
+                        n_prev=n_prev,
+                        init_model_path=cbm_path,
+                    )
+                    for c in cores
+                ]
+        else:
+            fits = [
+                c.fit(
+                    payload, r,
+                    t0_override=(r1_t0 if r == 1 else None),
+                    local_iters_override=(eff_local_iters if r > 1 else None),
+                    n_prev=(n_prev if model_type != "mlp" else 0),
+                )
+                for c in cores
+            ]
         payloads = [f[0] for f in fits]
         weights = [f[1] for f in fits]
         if model_type == "mlp":
@@ -85,7 +103,13 @@ def run_local_engine(cores, model_type, rounds, normalize, budget,
         down = (len(payload) if model_type != "mlp"
                 else int(sum(a.nbytes for a in payload))) * len(cores)
         up_bytes += up; down_bytes += down
-        evals = [c.evaluate(payload, server_round=r) for c in cores]
+        # Deserialize global tree model ONCE per round instead of once per client.
+        loaded_eval = None
+        if model_type == "xgboost":
+            loaded_eval = M.bytes_to_xgb(payload)
+        elif model_type == "catboost":
+            loaded_eval = M.bytes_to_cat(payload)
+        evals = [c.evaluate(payload, server_round=r, loaded_model=loaded_eval) for c in cores]
         aps = []
         valid_aps = []
         for e in evals:
@@ -246,7 +270,10 @@ def _pr_curve_plot(clients, payloads, ensemble_res, pooled, dataset, out_path,
         if payload is None:
             continue
         cmap = clients[mt] if is_nested and mt in clients else clients
-        s = np.concatenate([cmap[name].predict(payload, "test") for name in silo_order])
+        loaded = (M.bytes_to_xgb(payload) if mt == "xgboost"
+                  else M.bytes_to_cat(payload) if mt == "catboost" else None)
+        s = np.concatenate([cmap[name].predict(payload, "test", loaded_model=loaded)
+                            for name in silo_order])
         per_model_scores[mt] = s
         p, r, _ = precision_recall_curve(y_order, s)
         ax.plot(r, p, lw=1.4, alpha=0.85, label=f"FL {mt}")
@@ -290,6 +317,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap_.add_argument("--t0", type=int, default=120)
     ap_.add_argument("--local-iters", type=int, default=15)
     ap_.add_argument("--mlp-epochs", type=int, default=2)
+    ap_.add_argument("--mlp-batch-size", type=int, default=1024)
     ap_.add_argument("--mlp-agg", default="fedavg", choices=["fedavg", "fedprox", "fedbn"])
     ap_.add_argument("--prox-mu", type=float, default=0.01)
     ap_.add_argument("--tree-agg", default="normalized", choices=["baseline", "normalized"])
@@ -299,6 +327,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap_.add_argument("--cent-iters", type=int, default=300)
     ap_.add_argument("--cent-epochs", type=int, default=6)
     ap_.add_argument("--seed", type=int, default=42)
+    ap_.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"],
+                     help="Compute device for MLP/XGBoost (auto uses CUDA if available)")
+    ap_.add_argument("--threads", type=int, default=0,
+                     help="CPU threads for XGBoost/CatBoost/Torch (0 = all CPU cores)")
+    ap_.add_argument("--model-cache-dir", default=None,
+                     help="Optional directory to cache trained FL models across ablation conditions")
     ap_.add_argument("--c-fp", type=float, default=None,
                      help="False-positive cost in dataset currency (defaults per dataset)")
     ap_.add_argument("--out", default="results/run")
@@ -343,15 +377,128 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _model_cache_key(args, mt: str, budget: int | None, eff_device: str,
+                     clients_df: dict) -> str:
+    """Deterministic SHA-256 key capturing every parameter that affects a model's FL weights."""
+    silo_sig = [(name, len(fr["train"]), len(fr["val"])) for name, fr in clients_df.items()]
+    spec = {
+        "v": 1,
+        "dataset": args.dataset,
+        "data": os.path.basename(os.path.normpath(args.data)),
+        "partition": args.partition,
+        "split": args.split,
+        "k": int(args.k),
+        "alpha": float(args.alpha) if args.partition == "dirichlet" else None,
+        "train_cap": int(args.train_cap),
+        "seed": int(args.seed),
+        "rounds": int(args.rounds),
+        "patience": int(args.patience),
+        "engine": args.engine,
+        "mt": mt,
+        "device": eff_device if mt in ("mlp", "xgboost") else "cpu",
+        "silos": silo_sig,
+    }
+    if mt == "mlp":
+        spec.update({
+            "mlp_epochs": int(args.mlp_epochs),
+            "mlp_batch_size": int(args.mlp_batch_size),
+            "mlp_agg": args.mlp_agg,
+            "prox_mu": float(args.prox_mu) if args.mlp_agg == "fedprox" else 0.0,
+        })
+    else:
+        spec.update({
+            "t0": int(args.t0),
+            "local_iters": int(args.local_iters),
+            "tree_agg": args.tree_agg,
+            "tree_weight": args.tree_weight if args.tree_agg == "normalized" else "uniform",
+            "budget": int(budget) if budget is not None else None,
+        })
+    raw = json.dumps(spec, sort_keys=True, separators=(",", ":")).encode()
+    return f"{mt}_{hashlib.sha256(raw).hexdigest()[:16]}"
+
+
+def _load_cached_model(cache_dir: str, key: str, mt: str, client_cores: list[FraudClient]):
+    entry_dir = os.path.join(cache_dir, key)
+    info_path = os.path.join(entry_dir, "info.json")
+    if not os.path.exists(info_path):
+        return None
+    try:
+        with open(info_path) as f:
+            info = json.load(f)
+        if mt == "mlp":
+            npz_path = os.path.join(entry_dir, "payload.npz")
+            if not os.path.exists(npz_path):
+                return None
+            with np.load(npz_path) as data:
+                payload = [data[f"a{i}"].copy() for i in range(len(data.files))]
+            if client_cores and client_cores[0].cfg.mlp_agg == "fedbn":
+                bn_cache_dir = os.path.join(entry_dir, "bn_state")
+                best_r = int(info.get("best_round", 0))
+                for c in client_cores:
+                    bn_file = os.path.join(bn_cache_dir, f"{c._bn_safe_name()}.npz")
+                    if not os.path.exists(bn_file):
+                        return None
+                    with np.load(bn_file) as bdata:
+                        bn = {int(k): bdata[k].copy() for k in bdata.files}
+                    c.local_bn = bn
+                    if best_r > 0:
+                        c.bn_history[best_r] = {k: v.copy() for k, v in bn.items()}
+                        c.active_bn_round = best_r
+                        c._save_local_bn(server_round=best_r)
+        else:
+            bin_path = os.path.join(entry_dir, "payload.bin")
+            if not os.path.exists(bin_path):
+                return None
+            with open(bin_path, "rb") as f:
+                payload = f.read()
+        return payload, info
+    except Exception:
+        return None
+
+
+def _save_cached_model(cache_dir: str, key: str, mt: str, payload, info: dict,
+                       client_cores: list[FraudClient]):
+    if payload is None:
+        return
+    os.makedirs(cache_dir, exist_ok=True)
+    entry_dir = os.path.join(cache_dir, key)
+    tmp_dir = f"{entry_dir}.tmp.{os.getpid()}"
+    if os.path.isdir(tmp_dir):
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    os.makedirs(tmp_dir, exist_ok=True)
+    try:
+        if mt == "mlp":
+            np.savez(os.path.join(tmp_dir, "payload.npz"),
+                     **{f"a{i}": a for i, a in enumerate(payload)})
+            if client_cores and client_cores[0].cfg.mlp_agg == "fedbn":
+                bn_cache_dir = os.path.join(tmp_dir, "bn_state")
+                os.makedirs(bn_cache_dir, exist_ok=True)
+                for c in client_cores:
+                    if c.local_bn is not None:
+                        np.savez(os.path.join(bn_cache_dir, f"{c._bn_safe_name()}.npz"),
+                                 **{str(k): v for k, v in c.local_bn.items()})
+        else:
+            with open(os.path.join(tmp_dir, "payload.bin"), "wb") as f:
+                f.write(payload)
+        with open(os.path.join(tmp_dir, "info.json"), "w") as f:
+            json.dump(info, f, indent=2, default=float)
+        if os.path.exists(entry_dir):
+            shutil.rmtree(entry_dir, ignore_errors=True)
+        os.replace(tmp_dir, entry_dir)
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def main():
     args = parse_args()
+    eff_dev, eff_threads = M.configure_runtime(args.device, args.threads)
 
     os.makedirs(args.out, exist_ok=True)
     model_types = [m.strip() for m in args.models.split(",")]
     normalize = args.tree_agg == "normalized"
     budget = args.tree_budget if (normalize and args.tree_budget and args.tree_budget > 0) else None
 
-    print(f"Loading {args.data} ({args.dataset}) ...")
+    print(f"Loading {args.data} ({args.dataset}) [device={eff_dev}, threads={eff_threads}] ...")
     loaders = {
         "indofraud": load_indofraud,
         "ulb": load_ulb,
@@ -389,6 +536,7 @@ def main():
     if bn_dir and os.path.isdir(bn_dir):
         shutil.rmtree(bn_dir, ignore_errors=True)
     ccfg = ClientCfg(t0=args.t0, local_iters=args.local_iters, mlp_epochs=args.mlp_epochs,
+                     mlp_batch_size=args.mlp_batch_size,
                      mlp_pos_weight=fed_mlp_pw, prox_mu=args.prox_mu, mlp_agg=args.mlp_agg,
                      seed=args.seed, dataset=args.dataset, bn_state_dir=bn_dir)
     # Build unscaled feature matrices once per client and share across models (halves RAM)
@@ -417,9 +565,20 @@ def main():
     size_weighted = args.tree_weight == "size"
     payloads, fl_info = {}, {}
     for mt in model_types:
-        print(f"Training federated {mt} ({args.engine}, {args.tree_agg}) ...")
-        payload, info = engine(cores[mt], mt, args.rounds, normalize, budget,
-                               size_weighted=size_weighted, patience=args.patience)
+        cached = None
+        cache_key = None
+        if args.model_cache_dir:
+            cache_key = _model_cache_key(args, mt, budget, eff_dev, clients_df)
+            cached = _load_cached_model(args.model_cache_dir, cache_key, mt, cores[mt])
+        if cached is not None:
+            payload, info = cached
+            print(f"Reusing cached federated {mt} ({cache_key}) ...")
+        else:
+            print(f"Training federated {mt} ({args.engine}, {args.tree_agg}) ...")
+            payload, info = engine(cores[mt], mt, args.rounds, normalize, budget,
+                                   size_weighted=size_weighted, patience=args.patience)
+            if args.model_cache_dir and cache_key is not None:
+                _save_cached_model(args.model_cache_dir, cache_key, mt, payload, info, cores[mt])
         payloads[mt] = payload
         fl_info[mt] = info
 

@@ -282,3 +282,58 @@ def test_cli_config_precedence_and_extreme_dirichlet():
     assert sum(len(p) for p in parts.values()) == n
     for p in parts.values():
         assert len(p) > 0 and int((p["split"] == "train").sum()) >= 2
+
+
+def test_model_cache_exact_equivalence(tmp_path):
+    """Cross-condition model cache must produce identical ensemble metrics (incl. FedBN)."""
+    cfg = SynthConfig(seed=42, n_customers=1200, n_merchants=150, horizon_days=60,
+                      start_date="2025-10-15")
+    data = generate(cfg)
+    data_dir = str(tmp_path / "data")
+    save_dataset(data, data_dir)
+
+    cache_dir = str(tmp_path / "_model_cache")
+    out_cold = str(tmp_path / "cold")
+    out_warm = str(tmp_path / "warm")
+    base_argv = [
+        "run_fl", "--data", data_dir, "--engine", "local",
+        "--models", "xgboost,catboost,mlp", "--partition", "profile",
+        "--k", "3", "--rounds", "2", "--t0", "30", "--local-iters", "5",
+        "--mlp-epochs", "1", "--mlp-agg", "fedbn",
+        "--tree-agg", "normalized", "--tree-budget", "90",
+        "--train-cap", "15000", "--no-baselines",
+        "--device", "cpu", "--threads", "2",
+        "--model-cache-dir", cache_dir,
+    ]
+    from fl_experiments.run_fl import main
+    old = sys.argv
+    try:
+        sys.argv = base_argv + ["--out", out_cold]
+        main()
+        # Cache directory must now contain 3 model entries
+        assert len(os.listdir(cache_dir)) == 3
+
+        sys.argv = base_argv + ["--out", out_warm]
+        main()
+    finally:
+        sys.argv = old
+
+    with open(os.path.join(out_cold, "results.json")) as f:
+        r_cold = json.load(f)
+    with open(os.path.join(out_warm, "results.json")) as f:
+        r_warm = json.load(f)
+
+    for vname in ("soft_voting", "weighted_voting", "weighted_calibrated_per_silo",
+                  "weighted_calibrated_bayes", "weighted_calibrated_bayes_1pct"):
+        assert np.isfinite(r_cold["ensemble"]["variants"][vname]["pooled_ap"])
+        assert r_warm["ensemble"]["variants"][vname]["pooled_ap"] == pytest.approx(
+            r_cold["ensemble"]["variants"][vname]["pooled_ap"], abs=1e-12
+        )
+        assert r_warm["ensemble"]["variants"][vname]["macro_ap"] == pytest.approx(
+            r_cold["ensemble"]["variants"][vname]["macro_ap"], abs=1e-12
+        )
+        assert r_warm["ensemble"]["variants"][vname]["ece"] == pytest.approx(
+            r_cold["ensemble"]["variants"][vname]["ece"], abs=1e-12
+        )
+    for mt in ("xgboost", "catboost", "mlp"):
+        assert r_warm["fl"][mt]["best_val_ap"] == pytest.approx(r_cold["fl"][mt]["best_val_ap"], abs=1e-12)
