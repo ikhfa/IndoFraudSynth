@@ -52,15 +52,25 @@ def test_ece_brier_and_bayes_cost():
 
 
 def test_platt_calibrator_activates_for_small_silo():
+    from fl_experiments.ensemble import PlattCalibrator
     rng = np.random.default_rng(0)
     y = np.array([0] * 500 + [1] * 12)
-    # Deliberately miscalibrated (compressed near 1e-4 like unnormalized GBDT)
-    s = np.concatenate([rng.uniform(1e-6, 1e-4, 500), rng.uniform(5e-4, 5e-3, 12)])
+    # Deliberately miscalibrated (compressed near 1e-13 like unnormalized GBDT)
+    s = np.concatenate([rng.uniform(1e-14, 1e-12, 500), rng.uniform(5e-12, 5e-11, 12)])
     cals, methods, oof = fit_calibrators({"xgb": {"s1": s}}, {"s1": y}, seed=42)
     assert methods["xgb"]["s1"] == "platt"
     assert cals["xgb"]["s1"] is not None
+    assert cals["xgb"]["s1"].slope_ > 0.0
     assert np.isfinite(oof["xgb"]["s1"]).all()
     assert (oof["xgb"]["s1"] >= 0).all() and (oof["xgb"]["s1"] <= 1).all()
+    # Ranking at 1e-13 scale MUST be preserved (previously destroyed by 1e-7 clip!)
+    pred = cals["xgb"]["s1"].predict(s)
+    assert np.isclose(ap(y, pred), ap(y, s), atol=1e-6)
+    assert ap(y, pred) > 0.95
+
+    # Monotonicity guard: even on anti-correlated noisy small silo, slope stays > 0
+    cal_noisy = PlattCalibrator().fit(np.linspace(0.01, 0.99, 20), np.array([1] * 5 + [0] * 15))
+    assert cal_noisy.slope_ >= 1e-3
 
 
 def test_default_c_fp_and_operational_alert_budget():

@@ -77,6 +77,10 @@ def test_end_to_end_local(tmp_path):
     assert np.isfinite(loc_xgb["savings"])
     assert np.isfinite(loc_xgb["bayes_savings_at_1pct"])
     assert np.isfinite(loc_xgb["ece"])
+    loc_ens = res["baselines"]["local_only"]["ensemble"]
+    assert 0.0 <= loc_ens["pooled_ap"] <= 1.0
+    assert np.isfinite(loc_ens["macro_ap"])
+    assert np.isfinite(loc_ens["bayes_savings_at_1pct"])
     # In-memory inference latency measured for all 3 models + end-to-end ensemble
     assert set(res["latency_ms_p95"].keys()) == {"xgboost", "catboost", "mlp", "ensemble"}
     assert res["latency_ms_p95"]["xgboost"] < 100.0
@@ -252,7 +256,8 @@ def test_cli_config_precedence_and_extreme_dirichlet():
     assert a1.engine == "local"
     assert a1.k == 5
     assert a1.rounds == 10           # inherited from default.yaml
-    assert a1.tree_budget == 800     # inherited from default.yaml
+    assert a1.patience == 5          # inherited from default.yaml
+    assert a1.tree_budget == 2000    # inherited from default.yaml
     assert a1.c_fp == 7500.0
 
     # Switching --dataset to ulb with default.yaml must NOT leak IDR c_fp=7500

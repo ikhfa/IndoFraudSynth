@@ -160,7 +160,8 @@ def inject_fraud(cfg: SynthConfig, rng: np.random.Generator, legit: pd.DataFrame
                     dow, pd_, pr = day_meta(ts)
                     # Most ATO triggers device_change; ~15% session/SIM hijack does not.
                     dev_chg = (rng.random(legs) < 0.85).astype(np.int8)
-                    new_p = (rng.random(legs) < 0.90).astype(np.int8)
+                    # Placeholder overwritten chronologically from payee graph in add_window_features.
+                    new_p = np.zeros(legs, np.int8)
                     frames.append(_base_rows(
                         legs, ts, np.full(legs, victim), payees, np.full(legs, -1),
                         np.full(legs, ridx[rail]), amt,
@@ -195,7 +196,6 @@ def inject_fraud(cfg: SynthConfig, rng: np.random.Generator, legit: pd.DataFrame
                         m_ids = merch
                         m_cats = merch_cats[merch]
                         reg_mm = (merch_regions[merch] != agent_regions[victim]).astype(np.int8)
-                        new_p = (rng.random(legs) < 0.78).astype(np.int8)
                     else:
                         payees = rng.choice(mule_ids, legs)
                         for p, t_leg, a in zip(payees, ts, amt):
@@ -203,13 +203,12 @@ def inject_fraud(cfg: SynthConfig, rng: np.random.Generator, legit: pd.DataFrame
                         m_ids = np.full(legs, -1)
                         m_cats = np.full(legs, -1)
                         reg_mm = (agent_regions[payees] != agent_regions[victim]).astype(np.int8)
-                        new_p = (rng.random(legs) < 0.85).astype(np.int8)
                     frames.append(_base_rows(
                         legs, ts, np.full(legs, victim), payees, m_ids,
                         np.full(legs, ridx[rail]), amt,
                         {"dow": dow, "is_payday": pd_, "is_promo": pr,
                          "device_change": np.zeros(legs, np.int8),   # social engineering!
-                         "new_payee": new_p,
+                         "new_payee": np.zeros(legs, np.int8),       # set by add_window_features
                          "region_mismatch": reg_mm,
                          "tenure": tenure(np.full(legs, victim), ts),
                          "merchant_cat": m_cats,
@@ -223,12 +222,19 @@ def inject_fraud(cfg: SynthConfig, rng: np.random.Generator, legit: pd.DataFrame
                     if produced > 0 and need - produced < 2:
                         break
                     mule = int(rng.choice(funded))
-                    events = received[mule]
+                    events = sorted(received[mule], key=lambda ev: ev[0])
                     legs = int(rng.integers(2, 6))
                     legs = min(legs, max(need - produced, 1 if need < 2 else 2))
-                    # Causal fan-out: strictly occurs AFTER the mule receives scam funds.
-                    last_in_ts = max(t_in for t_in, _ in events)
-                    total_in = sum(a_in for _, a_in in events)
+                    # Causal per-batch fan-out: pick one intake event and group any
+                    # inflows within 24h so mules launder promptly after each intake
+                    # rather than waiting for the horizon-wide max(t_in) (which would
+                    # artificially skew MULEs into the val/test tail).
+                    anchor_idx = int(rng.integers(0, len(events)))
+                    anchor_ts = events[anchor_idx][0]
+                    batch = [ev for ev in events if anchor_ts <= ev[0] <= anchor_ts + 86400]
+                    remaining = [ev for ev in events if not (anchor_ts <= ev[0] <= anchor_ts + 86400)]
+                    last_in_ts = max(t_in for t_in, _ in batch)
+                    total_in = sum(a_in for _, a_in in batch)
                     t0 = min(last_in_ts + int(rng.integers(300, 7200)),
                              horizon_end - max(legs + 1, 600))
                     t0 = min(max(t0, last_in_ts + 1), horizon_end - 1)
@@ -240,14 +246,14 @@ def inject_fraud(cfg: SynthConfig, rng: np.random.Generator, legit: pd.DataFrame
                     split = rng.dirichlet(np.ones(legs)) * total
                     amt = np.clip(split, 50_000, caps[rail])
                     payees = rng.choice(agg_ids, legs)
-                    received[mule] = []
+                    received[mule] = remaining
                     dow, pd_, pr = day_meta(ts)
                     frames.append(_base_rows(
                         legs, ts, np.full(legs, mule), payees, np.full(legs, -1),
                         np.full(legs, ridx[rail]), amt,
                         {"dow": dow, "is_payday": pd_, "is_promo": pr,
                          "device_change": (rng.random(legs) < 0.05).astype(np.int8),
-                         "new_payee": (rng.random(legs) < 0.85).astype(np.int8),
+                         "new_payee": np.zeros(legs, np.int8),       # set by add_window_features
                          "region_mismatch": (agent_regions[payees] !=
                                              agent_regions[mule]).astype(np.int8),
                          "tenure": tenure(np.full(legs, mule), ts),
@@ -282,7 +288,7 @@ def inject_fraud(cfg: SynthConfig, rng: np.random.Generator, legit: pd.DataFrame
                         np.full(legs, ridx[rail]), amt,
                         {"dow": dow, "is_payday": pd_, "is_promo": pr,
                          "device_change": np.zeros(legs, np.int8),
-                         "new_payee": (rng.random(legs) < 0.70).astype(np.int8),
+                         "new_payee": np.zeros(legs, np.int8),       # set by add_window_features
                          "region_mismatch": (agent_regions[payers] !=
                                              merch_regions[merch]).astype(np.int8),
                          "tenure": tenure(payers, ts),

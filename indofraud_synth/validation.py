@@ -75,11 +75,31 @@ def calibration_report(tx: pd.DataFrame, cfg: SynthConfig) -> dict:
         sub_sp = tx[sp == sp_name]
         split_typ[sp_name] = {k: int(v) for k, v in sub_sp.typology.value_counts().items()}
 
+    expected_typs = {t for mix in cfg.typology_mix.values() for t, sh in mix.items() if sh > 0}
+    split_cov_ok = all(
+        all(split_typ[sp_name].get(t, 0) > 0 for t in expected_typs)
+        for sp_name in ("train", "val", "test")
+    )
+    # Enforce full typology coverage across train/val/test at publication scale (n >= 500k)
+    if n >= 500_000:
+        min_cov = min(
+            split_typ[sp_name].get(t, 0)
+            for sp_name in ("train", "val", "test")
+            for t in expected_typs
+        ) if expected_typs else 1
+        checks.append({
+            "check": "split_typology_min_count",
+            "actual": float(min_cov),
+            "target": [1, 1e9],
+            "ok": bool(split_cov_ok),
+        })
+
     ok = all(c["ok"] for c in checks)
     return {"ok": ok, "checks": checks,
             "silo_sizes": {str(k): int(v) for k, v in silo_sizes.items()},
             "typology_counts": {k: int(v) for k, v in tx.typology.value_counts().items()},
-            "split_typology_counts": split_typ}
+            "split_typology_counts": split_typ,
+            "split_typology_coverage_ok": bool(split_cov_ok)}
 
 
 def report_markdown(report: dict) -> str:

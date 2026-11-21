@@ -15,13 +15,14 @@ experiment:
   partition: profile
   k: 10
   rounds: 10
+  patience: 5             # federated early stopping (0 = run all rounds)
   t0: 300
   local_iters: 20
   mlp_epochs: 5
   mlp_agg: fedbn          # ablate: fedavg | fedprox | fedbn
   prox_mu: 0.01
   tree_agg: normalized
-  tree_budget: 800
+  tree_budget: 2000       # ~200 effective boosting steps across K=10 (vs 4,800 unbudgeted baseline)
   train_cap: 400000
   cent_iters: 600
   cent_epochs: 10

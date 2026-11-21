@@ -10,8 +10,9 @@ scale without overfitting `val`.
 from __future__ import annotations
 
 import numpy as np
+from scipy.optimize import minimize
+from scipy.special import expit
 from sklearn.isotonic import IsotonicRegression
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import f1_score
 from sklearn.model_selection import StratifiedKFold
 
@@ -24,22 +25,55 @@ MODEL_TYPES = ["xgboost", "catboost", "mlp"]
 
 
 class PlattCalibrator:
-    """2-parameter Platt / logit-temperature calibrator (low-variance for small silos)."""
+    """Monotonic 2-parameter Platt / logit-temperature calibrator (low-variance for small silos).
 
-    def __init__(self, c: float = 10.0):
-        self.lr = LogisticRegression(C=c, solver="lbfgs", max_iter=200)
+    Enforces strictly positive slope `a >= 1e-3` via L-BFGS-B so calibration can
+    never invert score rankings on small silos, and clips at `1e-15` (float64 safe)
+    so severely under-scaled unnormalized GBDT probabilities retain their ranking.
+    """
+
+    def __init__(self, reg: float = 0.1):
+        self.reg = float(reg)
+        self.slope_: float = 1.0
+        self.intercept_: float = 0.0
 
     @staticmethod
     def _to_logit(s: np.ndarray) -> np.ndarray:
-        p = np.clip(np.asarray(s, dtype=np.float64), 1e-7, 1.0 - 1e-7)
-        return np.log(p / (1.0 - p)).reshape(-1, 1)
+        p = np.clip(np.asarray(s, dtype=np.float64), 1e-15, 1.0 - 1e-15)
+        return np.log(p / (1.0 - p))
 
     def fit(self, scores: np.ndarray, y: np.ndarray) -> "PlattCalibrator":
-        self.lr.fit(self._to_logit(scores), np.asarray(y, dtype=int))
+        z = self._to_logit(scores)
+        yf = np.asarray(y, dtype=np.float64)
+        reg = self.reg
+
+        def _obj_and_grad(params):
+            a, b = float(params[0]), float(params[1])
+            m = a * z + b
+            # Overflow-safe binary cross-entropy + mild L2 penalty on slope
+            loss = float(np.sum(np.logaddexp(0.0, m) - yf * m) + 0.5 * reg * (a * a))
+            diff = expit(m) - yf
+            grad = np.array([
+                float(np.dot(diff, z) + reg * a),
+                float(np.sum(diff)),
+            ], dtype=np.float64)
+            return loss, grad
+
+        res = minimize(
+            _obj_and_grad,
+            x0=np.array([1.0, 0.0], dtype=np.float64),
+            jac=True,
+            method="L-BFGS-B",
+            bounds=[(1e-3, 50.0), (-50.0, 50.0)],
+            options={"maxiter": 200},
+        )
+        self.slope_ = float(res.x[0])
+        self.intercept_ = float(res.x[1])
         return self
 
     def predict(self, scores: np.ndarray) -> np.ndarray:
-        return self.lr.predict_proba(self._to_logit(scores))[:, 1]
+        z = self._to_logit(scores)
+        return expit(self.slope_ * z + self.intercept_)
 
 
 def _make_calibrator(y: np.ndarray):
@@ -195,7 +229,8 @@ def _eval_variant(test_scores, clients, thr_map, c_fp, use_bayes=False,
     return out
 
 
-def evaluate_ensemble(clients, payloads, c_fp=7500.0, seed=42, n_draws=300):
+def evaluate_ensemble(clients, payloads, c_fp=7500.0, seed=42, n_draws=300,
+                      out_plot_scores: dict | None = None):
     first_val = next(iter(clients.values()))
     ref_clients = first_val if isinstance(first_val, dict) else clients
     val_scores = gather_scores(clients, payloads, "val")
@@ -227,6 +262,9 @@ def evaluate_ensemble(clients, payloads, c_fp=7500.0, seed=42, n_draws=300):
         for m in models
     }
     cal_test = combine(cal_test_by_m, cal_weights)
+    if out_plot_scores is not None:
+        out_plot_scores["weighted"] = w_test
+        out_plot_scores["calibrated"] = cal_test
 
     variants = {}
     # individual global models (global cost threshold from pooled val — non-private baseline)

@@ -194,3 +194,12 @@ def test_v1_behavioral_realism_invariants():
     rep = calibration_report(tx, cfg)
     assert rep["ok"], [c for c in rep["checks"] if not c["ok"]]
     assert set(rep["split_typology_counts"].keys()) == {"train", "val", "test"}
+    assert isinstance(rep["split_typology_coverage_ok"], bool)
+
+    # 6. MULE fan-outs are NOT artificially pushed to the horizon tail (per-batch laundering)
+    mule_tr = rep["split_typology_counts"]["train"].get("MULE", 0)
+    mule_tot = rep["typology_counts"].get("MULE", 0)
+    if mule_tot >= 20:
+        assert mule_tr / mule_tot >= 0.50, (
+            f"MULE fan-out skewed into val/test tail: train={mule_tr}/{mule_tot}"
+        )

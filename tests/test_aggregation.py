@@ -419,3 +419,35 @@ def test_delta_tree_upload_matches_full_merge_and_single_class_guard(data):
     # Evaluation on all-negative val reports has_pos=0.0 cleanly (no NaN/warning)
     _, _, ev_met = c_zero.evaluate(merged_skip, server_round=1)
     assert ev_met["has_pos"] == 0.0
+
+
+def test_federated_early_stopping_patience():
+    """Federated patience stops both local and Flower engines when val AP plateaus."""
+    import pandas as pd
+    from fl_experiments.run_fl import run_local_engine, run_flower_engine
+
+    rng = np.random.default_rng(123)
+    n = 300
+    def _mk_df(seed_off):
+        r = np.random.default_rng(seed_off)
+        df = pd.DataFrame({f"V{i}": r.normal(size=n) for i in range(1, 5)})
+        df["Amount_log"] = r.uniform(1, 5, n)
+        df["hour"] = r.integers(0, 24, n)
+        df["Amount"] = np.expm1(df["Amount_log"])
+        df["is_fraud"] = (df["V1"] > 1.5).astype(np.int8)
+        return df
+
+    # Perfectly separable threshold -> Round 1 already hits AP=1.0, so patience=1 stops at Round 2
+    frames = {"train": _mk_df(1), "val": _mk_df(2), "test": _mk_df(3)}
+    cfg = ClientCfg(t0=15, local_iters=5, dataset="ulb", seed=42)
+    cores_loc = [FraudClient(f"s{i}", "xgboost", frames, cfg) for i in range(2)]
+    _, info_loc = run_local_engine(cores_loc, "xgboost", rounds=6, normalize=False,
+                                   budget=None, patience=1, verbose=False)
+    assert info_loc["stopped_early"] is True
+    assert len(info_loc["rounds"]) < 6
+
+    cores_fl = [FraudClient(f"s{i}", "xgboost", frames, cfg) for i in range(2)]
+    _, info_fl = run_flower_engine(cores_fl, "xgboost", rounds=6, normalize=False,
+                                   budget=None, patience=1, verbose=False)
+    assert info_fl["stopped_early"] is True
+    assert len(info_fl["rounds"]) < 6

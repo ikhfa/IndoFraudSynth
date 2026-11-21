@@ -16,6 +16,7 @@ import argparse
 import copy
 import json
 import os
+import shutil
 import tempfile
 import time
 
@@ -38,10 +39,12 @@ from . import models as M
 
 
 def run_local_engine(cores, model_type, rounds, normalize, budget,
-                     size_weighted=False, verbose=True):
+                     size_weighted=False, patience: int = 0, verbose=True):
     payload = None
     n_prev = foundation = 0
     best_ap, best_payload, best_round = -1.0, None, 0
+    stale = 0
+    stopped_early = False
     logs = []
     up_bytes = down_bytes = 0
     use_plan = model_type != "mlp" and normalize and budget is not None
@@ -98,16 +101,26 @@ def run_local_engine(cores, model_type, rounds, normalize, budget,
             best_ap, best_round = macro, r
             best_payload = ([a.copy() for a in payload] if model_type == "mlp"
                             else payload)
+            stale = 0
+        else:
+            stale += 1
         logs.append({"round": r, "macro_val_ap": macro, "per_client_ap": aps,
                      "size": size_metric, "upload_bytes": up, "broadcast_bytes": down,
                      "seconds": round(time.perf_counter() - t0, 2)})
         if verbose:
             print(f"  [{model_type}] round {r}: macro_val_AP={macro:.4f} "
                   f"size={size_metric} ({logs[-1]['seconds']}s)")
+        if patience > 0 and stale >= patience:
+            stopped_early = True
+            if verbose:
+                print(f"  [{model_type}] early stopping after round {r} "
+                      f"(no improvement for {patience} rounds)")
+            break
     if model_type == "mlp" and best_round > 0:
         for c in cores:
             c.restore_bn_round(best_round)
     return best_payload, {"best_round": best_round, "best_val_ap": best_ap,
+                          "stopped_early": stopped_early,
                           "rounds": logs, "upload_bytes": up_bytes,
                           "broadcast_bytes": down_bytes}
 
@@ -146,7 +159,7 @@ def _run_flower_inprocess(client_fn, num_clients, rounds, strategy):
 
 
 def run_flower_engine(cores, model_type, rounds, normalize, budget,
-                      size_weighted=False, verbose=True):
+                      size_weighted=False, patience: int = 0, verbose=True):
     import importlib.util
     import flwr as fl
     from .strategy import TreeBaggingStrategy, MLPStrategy
@@ -161,12 +174,12 @@ def run_flower_engine(cores, model_type, rounds, normalize, budget,
     )
     if model_type == "mlp":
         strategy = MLPStrategy(initial_arrays=cores[0]._initial_mlp(),
-                               min_clients=len(cores))
+                               min_clients=len(cores), patience=patience)
     else:
         strategy = TreeBaggingStrategy(model_kind=model_type, normalize=normalize,
                                        budget=budget, min_clients=len(cores),
                                        r1_t0=r1_t0, eff_local_iters=eff_local_iters,
-                                       size_weighted=size_weighted)
+                                       size_weighted=size_weighted, patience=patience)
 
     def client_fn(cid: str):
         return make_flower_client(cores[int(cid)]).to_client()
@@ -199,6 +212,7 @@ def run_flower_engine(cores, model_type, rounds, normalize, budget,
             c.restore_bn_round(strategy.best_round)
 
     info = {"best_round": strategy.best_round, "best_val_ap": strategy.best_ap,
+            "stopped_early": strategy.stopped_early,
             "rounds": strategy.round_logs,
             "upload_bytes": strategy.total_client_bytes,
             "broadcast_bytes": strategy.total_broadcast_bytes,
@@ -207,7 +221,8 @@ def run_flower_engine(cores, model_type, rounds, normalize, budget,
     return strategy.best_payload, info
 
 
-def _pr_curve_plot(clients, payloads, ensemble_res, pooled, dataset, out_path):
+def _pr_curve_plot(clients, payloads, ensemble_res, pooled, dataset, out_path,
+                   plot_scores: dict | None = None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -235,7 +250,13 @@ def _pr_curve_plot(clients, payloads, ensemble_res, pooled, dataset, out_path):
         if w and all(m in per_model_scores for m in w):
             ens_s = sum(w[m] * per_model_scores[m] for m in w)
             p, r, _ = precision_recall_curve(y_order, ens_s)
-            ax.plot(r, p, lw=2.2, color="black", linestyle="--", label="FL Weighted Ensemble")
+            ax.plot(r, p, lw=1.8, color="#444444", linestyle="--",
+                    label="FL Weighted Ensemble (uncalibrated)")
+        if plot_scores and "calibrated" in plot_scores:
+            cal_s = np.concatenate([plot_scores["calibrated"][name] for name in silo_order])
+            p, r, _ = precision_recall_curve(y_order, cal_s)
+            ax.plot(r, p, lw=2.3, color="black", linestyle="-",
+                    label="FL Proposed Calibrated Ensemble")
 
     ax.set_xlabel("Recall"); ax.set_ylabel("Precision")
     ax.set_title("Test Precision–Recall: Federated Models & Ensemble")
@@ -258,6 +279,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap_.add_argument("--k", type=int, default=5)
     ap_.add_argument("--alpha", type=float, default=0.5)
     ap_.add_argument("--rounds", type=int, default=3)
+    ap_.add_argument("--patience", type=int, default=0,
+                     help="Federated early stopping patience on macro val AP (0 = run all rounds)")
     ap_.add_argument("--t0", type=int, default=120)
     ap_.add_argument("--local-iters", type=int, default=15)
     ap_.add_argument("--mlp-epochs", type=int, default=2)
@@ -350,6 +373,8 @@ def main():
 
     bn_dir = (os.path.join(args.out, "_bn_state")
               if (args.mlp_agg == "fedbn" and args.engine == "flower") else None)
+    if bn_dir and os.path.isdir(bn_dir):
+        shutil.rmtree(bn_dir, ignore_errors=True)
     ccfg = ClientCfg(t0=args.t0, local_iters=args.local_iters, mlp_epochs=args.mlp_epochs,
                      prox_mu=args.prox_mu, mlp_agg=args.mlp_agg, seed=args.seed,
                      dataset=args.dataset, bn_state_dir=bn_dir)
@@ -363,7 +388,7 @@ def main():
     for mt in model_types:
         print(f"Training federated {mt} ({args.engine}, {args.tree_agg}) ...")
         payload, info = engine(cores[mt], mt, args.rounds, normalize, budget,
-                               size_weighted=size_weighted)
+                               size_weighted=size_weighted, patience=args.patience)
         payloads[mt] = payload
         fl_info[mt] = info
 
@@ -384,10 +409,12 @@ def main():
             local_t0=args.t0, c_fp=args.c_fp, seed=args.seed,
             clients_df=clients_df)
 
+    plot_scores = {}
     if not args.no_ensemble and len(payloads) >= 2:
         print("Evaluating ensembles ...")
         results["ensemble"] = evaluate_ensemble(cores_by_mt, payloads,
-                                                c_fp=args.c_fp, seed=args.seed)
+                                                c_fp=args.c_fp, seed=args.seed,
+                                                out_plot_scores=plot_scores)
 
     # latency (in-memory loaded models — excludes JSON/cbm deserialization!) + model size
     sizes = {}
@@ -437,7 +464,8 @@ def main():
         json.dump(results, f, indent=2, default=float)
     try:
         _pr_curve_plot(cores_by_mt, payloads, results.get("ensemble"),
-                       pooled, args.dataset, os.path.join(args.out, "pr_curve.png"))
+                       pooled, args.dataset, os.path.join(args.out, "pr_curve.png"),
+                       plot_scores=plot_scores)
     except Exception as e:  # plotting must never kill a run
         print(f"(plot skipped: {e})")
 

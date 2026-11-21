@@ -196,3 +196,21 @@ def test_stats_primary_scope_power_warning_and_multiparts(tmp_path):
     assert rep10["statistics"]["n_blocks"] == 10
     assert rep10["statistics"]["power_warning"] is None
     assert any(row["significant"] for row in rep10["statistics"]["holm_wilcoxon"])
+
+
+def test_select_primary_methods_deduplicates_baselines():
+    """Primary scope must pick 1 anchor each for centralized and local_only
+    (preferring ensemble) rather than all 7 individual baseline models."""
+    complete = [
+        "centralized:xgboost", "centralized:catboost", "centralized:mlp", "centralized:ensemble",
+        "local_only:xgboost", "local_only:catboost", "local_only:mlp", "local_only:ensemble",
+        "baseline:soft_voting", "baseline:weighted_voting", "baseline:weighted_calibrated_bayes_1pct",
+        "normalized_fedbn:weighted_voting", "normalized_fedbn:weighted_calibrated_bayes_1pct",
+    ]
+    sel = set(select_primary_methods(complete))
+    assert sel == {
+        "centralized:ensemble",
+        "local_only:ensemble",
+        "baseline:weighted_voting",
+        "normalized_fedbn:weighted_calibrated_bayes_1pct",
+    }

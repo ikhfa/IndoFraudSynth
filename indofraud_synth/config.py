@@ -75,8 +75,6 @@ class SynthConfig:
     promo_mult: float = 2.6                 # Harbolnas uplift
     thr_mult: float = 1.4
     device_change_noise: float = 0.005      # benign device switches / reinstalls
-    new_payee_noise: float = 0.10           # benign first-time P2P payees
-    new_payee_noise_merchant: float = 0.22  # benign first-time merchant visits (QRIS/VA/CARD)
     drift_strength: float = 0.25            # test-window fraud-campaign adaptation (0 = stationary)
     out_dir: str = "data/indofraud_v0"
 

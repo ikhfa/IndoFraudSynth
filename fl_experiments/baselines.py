@@ -136,6 +136,12 @@ def run_baselines(pooled, clients, model_types, dataset="indofraud",
     cent_val_scores: dict[str, np.ndarray] = {}
     cent_test_scores: dict[str, np.ndarray] = {}
     cent_silo_scores: dict[str, dict[str, np.ndarray]] = {}
+    local_val_scores: dict[str, dict[str, np.ndarray]] = {}
+    local_test_scores: dict[str, dict[str, np.ndarray]] = {}
+    local_val_y: dict[str, np.ndarray] = {}
+    local_test_y: dict[str, np.ndarray] = {}
+    local_val_amt: dict[str, np.ndarray] = {}
+    local_test_amt: dict[str, np.ndarray] = {}
 
     for mt in model_types:
         mt_clients = clients[mt] if is_nested and mt in clients else clients
@@ -251,6 +257,12 @@ def run_baselines(pooled, clients, model_types, dataset="indofraud",
             per_silo[name] = float(a) if not np.isnan(a) else None
             ys_loc.append(ly_te); ss_loc.append(st_l)
             amts_loc.append(la_te); flags_loc.append(fl_l)
+            local_val_scores.setdefault(mt, {})[name] = np.asarray(sv_l, dtype=np.float64)
+            local_test_scores.setdefault(mt, {})[name] = np.asarray(st_l, dtype=np.float64)
+            local_val_y[name] = ly_va
+            local_test_y[name] = ly_te
+            local_val_amt[name] = la_va
+            local_test_amt[name] = la_te
 
         vals = [v for v in per_silo.values() if v is not None]
         y_loc_all = np.concatenate(ys_loc) if ys_loc else np.zeros(0, dtype=np.int8)
@@ -309,5 +321,60 @@ def run_baselines(pooled, clients, model_types, dataset="indofraud",
         ens_metrics["val_objective_ap"] = float(cal_val_obj)
         ens_metrics["calibration_methods"] = {m: cal_methods[m]["pooled"] for m in models_present}
         results["centralized"]["ensemble"] = ens_metrics
+
+    # Local-only calibrated ensemble (strictly silo-local calibration, weights, and thresholds)
+    if len(local_val_scores) >= 2:
+        loc_models = list(local_val_scores.keys())
+        loc_silos = list(local_test_y.keys())
+        loc_per_silo_ap = {}
+        loc_weights = {}
+        ys_le, ss_le, amts_le, flags_le = [], [], [], []
+        tot_cost_le, tot_loss_le = 0.0, 0.0
+        for s_idx, s in enumerate(loc_silos):
+            sv_s = {m: {s: local_val_scores[m][s]} for m in loc_models}
+            yv_s = {s: local_val_y[s]}
+            cals_s, _, oof_s = fit_calibrators(sv_s, yv_s, seed=seed + s_idx)
+            w_s, _ = search_weights(oof_s, yv_s, n_draws=300, seed=seed + s_idx)
+            loc_weights[s] = w_s
+            ens_va_s = sum(w_s[m] * oof_s[m][s] for m in loc_models)
+            ens_te_s = sum(
+                w_s[m] * (cals_s[m][s].predict(local_test_scores[m][s])
+                          if cals_s[m][s] is not None else local_test_scores[m][s])
+                for m in loc_models
+            )
+            thr_s, _ = cost_threshold(local_val_y[s], ens_va_s, local_val_amt[s], c_fp)
+            fl_s = (ens_te_s >= thr_s).astype(int)
+            tot_cost_le += fraud_cost(local_test_y[s], ens_te_s, thr_s, local_test_amt[s], c_fp)
+            tot_loss_le += float(local_test_amt[s][local_test_y[s] == 1].sum())
+            a_s = ap(local_test_y[s], ens_te_s)
+            loc_per_silo_ap[s] = float(a_s) if not np.isnan(a_s) else None
+            ys_le.append(local_test_y[s])
+            ss_le.append(ens_te_s)
+            amts_le.append(local_test_amt[s])
+            flags_le.append(fl_s)
+
+        vals_le = [v for v in loc_per_silo_ap.values() if v is not None]
+        y_le_all = np.concatenate(ys_le) if ys_le else np.zeros(0, dtype=np.int8)
+        s_le_all = np.concatenate(ss_le) if ss_le else np.zeros(0, dtype=np.float64)
+        a_le_all = np.concatenate(amts_le) if amts_le else np.zeros(0, dtype=np.float64)
+        f_le_all = np.concatenate(flags_le) if flags_le else np.zeros(0, dtype=int)
+        b_le_all = bayes_cost_predict(s_le_all, a_le_all, c_fp=c_fp)
+        results["local_only"]["ensemble"] = {
+            "macro_ap": float(np.mean(vals_le)) if vals_le else float("nan"),
+            "pooled_ap": ap(y_le_all, s_le_all) if len(y_le_all) else float("nan"),
+            "recall_at_fpr_001": recall_at_fpr(y_le_all, s_le_all, 0.01) if len(y_le_all) else float("nan"),
+            "f1": float(f1_score(y_le_all, f_le_all, zero_division=0)) if len(y_le_all) else float("nan"),
+            "alert_rate": alert_rate(f_le_all),
+            "fpr": fpr_flags(y_le_all, f_le_all),
+            "savings": float(1.0 - tot_cost_le / tot_loss_le) if tot_loss_le > 0 else float("nan"),
+            "bayes_savings": bayes_savings(y_le_all, s_le_all, a_le_all, c_fp),
+            "bayes_alert_rate": alert_rate(b_le_all),
+            "bayes_savings_at_1pct": bayes_savings(y_le_all, s_le_all, a_le_all, c_fp, max_alert_rate=0.01),
+            "bayes_savings_at_01pct": bayes_savings(y_le_all, s_le_all, a_le_all, c_fp, max_alert_rate=0.001),
+            "ece": ece(y_le_all, s_le_all),
+            "brier": brier(y_le_all, s_le_all),
+            "per_silo_ap": loc_per_silo_ap,
+            "per_silo_weights": loc_weights,
+        }
 
     return results

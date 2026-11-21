@@ -53,10 +53,18 @@ _PROPOSED_VARIANT_PREF = (
 )
 
 
+_BASELINE_ANCHOR_PREF = (
+    "ensemble",
+    "xgboost",
+    "catboost",
+    "mlp",
+)
+
+
 def select_primary_methods(complete_methods: list[str]) -> list[str]:
-    """Select 1 canonical representative per FL condition (plus centralized/local
-    baselines) so Friedman-Nemenyi and Holm-Wilcoxon tests are not diluted by
-    20+ strongly correlated ensemble variants from the same FL runs."""
+    """Select 1 canonical representative per FL condition and 1 per baseline anchor
+    (`centralized` / `local_only`, preferring `ensemble`) so Friedman-Nemenyi and
+    Holm-Wilcoxon tests are not diluted by 12–20 strongly correlated variants."""
     by_cond: dict[str, dict[str, str]] = {}
     selected: list[str] = []
     for m in complete_methods:
@@ -64,14 +72,16 @@ def select_primary_methods(complete_methods: list[str]) -> list[str]:
             selected.append(m)
             continue
         cond, var = m.split(":", 1)
-        if cond in ("centralized", "local_only"):
-            selected.append(m)
-        else:
-            by_cond.setdefault(cond, {})[var] = m
+        by_cond.setdefault(cond, {})[var] = m
 
     for cond in sorted(by_cond):
         variants = by_cond[cond]
-        pref = _BASELINE_VARIANT_PREF if cond == "baseline" else _PROPOSED_VARIANT_PREF
+        if cond in ("centralized", "local_only"):
+            pref = _BASELINE_ANCHOR_PREF
+        elif cond == "baseline":
+            pref = _BASELINE_VARIANT_PREF
+        else:
+            pref = _PROPOSED_VARIANT_PREF
         chosen = None
         for v in pref:
             if v in variants:

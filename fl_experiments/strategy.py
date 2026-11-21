@@ -16,10 +16,13 @@ from .aggregation import merge_trees, tree_count, merge_mlp, compute_r1_t0
 
 
 class _BestTracker:
-    def __init__(self):
+    def __init__(self, patience: int = 0):
         self.best_ap = -1.0
         self.best_payload = None
         self.best_round = 0
+        self.patience = int(patience or 0)
+        self.stale_rounds = 0
+        self.stopped_early = False
         self.round_logs = []
         self._pending_fit = {}
         self.total_client_bytes = 0
@@ -50,6 +53,11 @@ class _BestTracker:
             self.best_payload = ([a.copy() for a in payload]
                                  if isinstance(payload, list) else payload)
             self.best_round = server_round
+            self.stale_rounds = 0
+        else:
+            self.stale_rounds += 1
+            if self.patience > 0 and self.stale_rounds >= self.patience:
+                self.stopped_early = True
         entry = self._pending_fit.pop(server_round, {"round": server_round})
         entry["macro_val_ap"] = macro
         entry["per_client_ap"] = aps
@@ -66,14 +74,14 @@ class TreeBaggingStrategy(FedAvg, _BestTracker):
     def __init__(self, model_kind: str, normalize: bool = False, budget=None,
                  min_clients: int = 3, r1_t0: int | None = None,
                  eff_local_iters: int | None = None,
-                 size_weighted: bool = False, **kwargs):
+                 size_weighted: bool = False, patience: int = 0, **kwargs):
         FedAvg.__init__(
             self, fraction_fit=1.0, fraction_evaluate=1.0,
             min_fit_clients=min_clients, min_evaluate_clients=min_clients,
             min_available_clients=min_clients,
             initial_parameters=ndarrays_to_parameters([np.zeros(0, dtype=np.uint8)]),
             accept_failures=False, **kwargs)
-        _BestTracker.__init__(self)
+        _BestTracker.__init__(self, patience=patience)
         self.model_kind = model_kind
         self.normalize = normalize
         self.budget = budget
@@ -85,6 +93,8 @@ class TreeBaggingStrategy(FedAvg, _BestTracker):
         self.current = None
 
     def configure_fit(self, server_round, parameters, client_manager):
+        if self.stopped_early:
+            return []
         ins = super().configure_fit(server_round, parameters, client_manager)
         for _, fit_ins in ins:
             fit_ins.config["server_round"] = server_round
@@ -120,6 +130,8 @@ class TreeBaggingStrategy(FedAvg, _BestTracker):
         return ndarrays_to_parameters([np.frombuffer(merged, dtype=np.uint8).copy()]), metrics
 
     def configure_evaluate(self, server_round, parameters, client_manager):
+        if self.stopped_early:
+            return []
         ins = super().configure_evaluate(server_round, parameters, client_manager)
         for _, ev_ins in ins:
             ev_ins.config["server_round"] = server_round
@@ -137,17 +149,19 @@ class TreeBaggingStrategy(FedAvg, _BestTracker):
 class MLPStrategy(FedAvg, _BestTracker):
     """FedAvg server-side; FedProx/FedBN semantics are client-side."""
 
-    def __init__(self, initial_arrays, min_clients: int = 3, **kwargs):
+    def __init__(self, initial_arrays, min_clients: int = 3, patience: int = 0, **kwargs):
         FedAvg.__init__(
             self, fraction_fit=1.0, fraction_evaluate=1.0,
             min_fit_clients=min_clients, min_evaluate_clients=min_clients,
             min_available_clients=min_clients,
             initial_parameters=ndarrays_to_parameters(initial_arrays),
             accept_failures=False, **kwargs)
-        _BestTracker.__init__(self)
+        _BestTracker.__init__(self, patience=patience)
         self.current = initial_arrays
 
     def configure_fit(self, server_round, parameters, client_manager):
+        if self.stopped_early:
+            return []
         ins = super().configure_fit(server_round, parameters, client_manager)
         for _, fit_ins in ins:
             fit_ins.config["server_round"] = server_round
@@ -170,6 +184,8 @@ class MLPStrategy(FedAvg, _BestTracker):
         return ndarrays_to_parameters(merged), {"client_upload_bytes": int(up)}
 
     def configure_evaluate(self, server_round, parameters, client_manager):
+        if self.stopped_early:
+            return []
         ins = super().configure_evaluate(server_round, parameters, client_manager)
         for _, ev_ins in ins:
             ev_ins.config["server_round"] = server_round
