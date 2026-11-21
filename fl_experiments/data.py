@@ -274,7 +274,7 @@ def temporal_split(df: pd.DataFrame, train_frac: float = 0.7, val_frac: float = 
     t1 = df.ts.quantile(train_frac)
     t2 = df.ts.quantile(train_frac + val_frac)
     split = np.where(df.ts <= t1, "train", np.where(df.ts <= t2, "val", "test"))
-    df = df.copy()
+    df = df.copy(deep=False)
     df["split"] = split
     return df, {"mode": "temporal", "t1": float(t1), "t2": float(t2)}
 
@@ -293,7 +293,7 @@ def random_split(df: pd.DataFrame, train_frac: float = 0.7, val_frac: float = 0.
         n_va = int(round(len(idx) * val_frac))
         split[idx[:n_tr]] = "train"
         split[idx[n_tr:n_tr + n_va]] = "val"
-    df = df.copy()
+    df = df.copy(deep=False)
     df["split"] = split
     return df, {"mode": "random", "seed": int(seed),
                 "train_frac": float(train_frac), "val_frac": float(val_frac)}
@@ -317,8 +317,9 @@ def subsample_train(train: pd.DataFrame, cap: int | None, seed: int = 42) -> pd.
 
 
 def make_clients(df: pd.DataFrame, mode: str, k: int, alpha: float = 0.5,
-                 seed: int = 42, train_cap: int | None = 200_000):
-    """Return (clients dict, pooled dict).
+                 seed: int = 42, train_cap: int | None = 200_000,
+                 include_pooled: bool = True):
+    """Return (clients dict, pooled dict or None).
 
     When `train_cap` is positive and exceeded by the largest silo, all silos are
     scaled by the SAME proportional factor `train_cap / max_client_train` so
@@ -326,23 +327,31 @@ def make_clients(df: pd.DataFrame, mode: str, k: int, alpha: float = 0.5,
     are preserved rather than flattening large silos to a uniform ceiling.
     Pass `train_cap=0` or `None` to train uncapped.
 
+    Set `include_pooled=False` (e.g., when `--no-baselines`) to avoid allocating
+    a duplicate concatenated `pooled['train']` DataFrame in RAM.
+
     `pooled['train']` is the exact union of all clients' training splits so the
     centralized baseline sees identical rows and class priors as the federation.
     """
+    import gc
+
     parts = partition(df, mode, k, alpha, seed)
-    raw_trains = {name: part[part.split == "train"] for name, part in parts.items()}
-    max_tr = max((len(tr) for tr in raw_trains.values()), default=0)
+    train_counts = {name: int((part.split == "train").sum()) for name, part in parts.items()}
+    max_tr = max(train_counts.values(), default=0)
     keep_frac = (
         float(train_cap) / float(max_tr)
         if (train_cap is not None and train_cap > 0 and max_tr > train_cap)
         else 1.0
     )
     clients = {}
-    for i, (name, part) in enumerate(parts.items()):
-        tr_full = raw_trains[name]
+    for i, name in enumerate(list(parts.keys())):
+        part = parts.pop(name)
+        is_tr = part.split == "train"
+        tr_full = part[is_tr]
         if keep_frac < 1.0:
             silo_cap = max(int(round(len(tr_full) * keep_frac)), min(len(tr_full), 2))
             tr = subsample_train(tr_full, silo_cap, seed + i)
+            del tr_full
         else:
             tr = tr_full
         clients[name] = {
@@ -350,6 +359,13 @@ def make_clients(df: pd.DataFrame, mode: str, k: int, alpha: float = 0.5,
             "val": part[part.split == "val"],
             "test": part[part.split == "test"],
         }
+        del part
+    del parts
+    gc.collect()
+
+    if not include_pooled:
+        return clients, None
+
     pooled_train = (
         pd.concat([c["train"] for c in clients.values()], ignore_index=True)
         .sort_values("ts", kind="stable")

@@ -514,9 +514,13 @@ def main():
         print(f"[warn] --partition profile is only defined for indofraud; "
               f"switching to dirichlet (alpha={args.alpha}) for {args.dataset}.")
         args.partition = "dirichlet"
-    clients_df, pooled = make_clients(df, args.partition, args.k, args.alpha,
-                                      args.seed, args.train_cap)
+    clients_df, pooled = make_clients(
+        df, args.partition, args.k, args.alpha,
+        args.seed, args.train_cap, include_pooled=not args.no_baselines,
+    )
     del df
+    import gc
+    gc.collect()
     print(f"Clients: { {k: len(v['train']) for k, v in clients_df.items()} }")
 
     # FL-safe global MLP standardization & pos_weight from per-client scalar sufficient
@@ -560,6 +564,7 @@ def main():
                               shared_raw=shared_by_silo[name])
                   for name, frames in clients_df.items()] for mt in model_types}
     del shared_by_silo
+    gc.collect()
 
     engine = run_flower_engine if args.engine == "flower" else run_local_engine
     size_weighted = args.tree_weight == "size"
