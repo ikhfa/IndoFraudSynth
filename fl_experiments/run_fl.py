@@ -520,26 +520,6 @@ def main():
     gc.collect()
     print(f"Clients: { {k: len(v['train']) for k, v in clients_df.items()} }")
 
-    # FL-safe global MLP standardization & pos_weight from per-client scalar sufficient
-    # statistics ((count, sum, sum_sq) and (n_pos, n_total)) — zero raw rows shared.
-    fed_pre = None
-    fed_mlp_pw = None
-    if "mlp" in model_types:
-        stats = [MLPPreprocessor.local_stats(build_matrix(fr["train"], args.dataset)[0])
-                 for fr in clients_df.values()]
-        fed_pre = MLPPreprocessor().fit_from_stats(stats)
-        tot_pos = sum(int(fr["train"].is_fraud.sum()) for fr in clients_df.values())
-        tot_n = sum(len(fr["train"]) for fr in clients_df.values())
-        fed_mlp_pw = M.compute_mlp_pos_weight(tot_pos, tot_n)
-
-    bn_dir = (os.path.join(args.out, "_bn_state")
-              if (args.mlp_agg == "fedbn" and args.engine == "flower") else None)
-    if bn_dir and os.path.isdir(bn_dir):
-        shutil.rmtree(bn_dir, ignore_errors=True)
-    ccfg = ClientCfg(t0=args.t0, local_iters=args.local_iters, mlp_epochs=args.mlp_epochs,
-                     mlp_batch_size=args.mlp_batch_size,
-                     mlp_pos_weight=fed_mlp_pw, prox_mu=args.prox_mu, mlp_agg=args.mlp_agg,
-                     seed=args.seed, dataset=args.dataset, bn_state_dir=bn_dir)
     # Build unscaled feature matrices once per client and share across models (halves RAM)
     shared_by_silo = {}
     for name, frames in clients_df.items():
@@ -555,6 +535,27 @@ def main():
             else:
                 sa[sp] = np.zeros(len(df_sp))
         shared_by_silo[name] = (sx, sy, sa)
+
+    # FL-safe global MLP standardization & pos_weight from per-client scalar sufficient
+    # statistics ((count, sum, sum_sq) and (n_pos, n_total)) — zero raw rows shared.
+    fed_pre = None
+    fed_mlp_pw = None
+    if "mlp" in model_types:
+        stats = [MLPPreprocessor.local_stats(shared_by_silo[name][0]["train"])
+                 for name in clients_df]
+        fed_pre = MLPPreprocessor().fit_from_stats(stats)
+        tot_pos = sum(int(shared_by_silo[name][1]["train"].sum()) for name in clients_df)
+        tot_n = sum(len(shared_by_silo[name][1]["train"]) for name in clients_df)
+        fed_mlp_pw = M.compute_mlp_pos_weight(tot_pos, tot_n)
+
+    bn_dir = (os.path.join(args.out, "_bn_state")
+              if (args.mlp_agg == "fedbn" and args.engine == "flower") else None)
+    if bn_dir and os.path.isdir(bn_dir):
+        shutil.rmtree(bn_dir, ignore_errors=True)
+    ccfg = ClientCfg(t0=args.t0, local_iters=args.local_iters, mlp_epochs=args.mlp_epochs,
+                     mlp_batch_size=args.mlp_batch_size,
+                     mlp_pos_weight=fed_mlp_pw, prox_mu=args.prox_mu, mlp_agg=args.mlp_agg,
+                     seed=args.seed, dataset=args.dataset, bn_state_dir=bn_dir)
 
     cores = {mt: [FraudClient(name, mt, frames, ccfg,
                               pre=(fed_pre if mt == "mlp" else None),
@@ -600,6 +601,8 @@ def main():
             cent_iters=args.cent_iters, cent_epochs=args.cent_epochs,
             local_t0=args.t0, c_fp=args.c_fp, seed=args.seed,
             clients_df=clients_df)
+        pooled = None
+        gc.collect()
 
     plot_scores = {}
     if not args.no_ensemble and len(payloads) >= 2:

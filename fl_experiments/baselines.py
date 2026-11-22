@@ -196,6 +196,9 @@ def run_baselines(pooled, clients, model_types, dataset="indofraud",
                 s_by_silo=silo_pred,
             )
             results["centralized"][mt]["best_epoch"] = int(getattr(model, "best_epoch_", cent_epochs))
+            del Xtr_s, Xva_s, Xte_s
+            import gc
+            gc.collect()
 
         cent_val_scores[mt] = sv
         cent_test_scores[mt] = st

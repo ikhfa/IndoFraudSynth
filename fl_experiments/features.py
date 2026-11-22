@@ -39,26 +39,36 @@ def build_matrix(df: pd.DataFrame, dataset: str = "indofraud"):
         X = df[cols].to_numpy(np.float32)
         return X, cols
 
-    d = pd.DataFrame(index=df.index)
-    d["amount_log"] = np.log1p(df.amount.to_numpy(np.float64))
-    hour = df.hour.to_numpy(np.float64)
-    d["hour_sin"] = np.sin(2 * np.pi * hour / 24)
-    d["hour_cos"] = np.cos(2 * np.pi * hour / 24)
-    for c in ["dow", "is_payday", "is_promo", "is_night", "device_change", "new_payee",
-              "region_mismatch", "velocity_1h", "velocity_24h", "amount_z",
-              "payee_indegree_24h", "merchant_velocity_24h", "merchant_vel_z"]:
-        d[c] = df[c].to_numpy(np.float64)
-    d["tenure_log"] = np.log1p(df.tenure_days.to_numpy(np.float64))
-    d["gap_prev_log"] = np.log1p(df.gap_prev_sec.to_numpy(np.float64))
-
-    rail = pd.Categorical(df.rail.to_numpy(), categories=range(len(RAIL_NAMES)))
-    rail_oh = pd.get_dummies(rail, prefix="rail").to_numpy(np.float64)
-    mcat = pd.Categorical(df.merchant_cat.to_numpy(), categories=MERCHANT_CATS)
-    mcat_oh = pd.get_dummies(mcat, prefix="mcat").to_numpy(np.float64)
-
-    X = np.concatenate([d[NUM_COLS].to_numpy(np.float64), rail_oh, mcat_oh], axis=1)
+    n = len(df)
     names = NUM_COLS + [f"rail_{r}" for r in RAIL_NAMES] + [f"mcat_{c}" for c in MERCHANT_CATS]
-    return X.astype(np.float32), names
+    X = np.zeros((n, len(names)), dtype=np.float32)
+
+    # Fill directly into float32 buffer (avoids multi-GB float64 DataFrame/concat intermediates)
+    hour = df.hour.to_numpy(np.float64)
+    col_values = {
+        "amount_log": np.log1p(df.amount.to_numpy(np.float64)).astype(np.float32),
+        "hour_sin": np.sin(2.0 * np.pi * hour / 24.0).astype(np.float32),
+        "hour_cos": np.cos(2.0 * np.pi * hour / 24.0).astype(np.float32),
+        "tenure_log": np.log1p(df.tenure_days.to_numpy(np.float64)).astype(np.float32),
+        "gap_prev_log": np.log1p(df.gap_prev_sec.to_numpy(np.float64)).astype(np.float32),
+    }
+    for j, c in enumerate(NUM_COLS):
+        if c in col_values:
+            X[:, j] = col_values[c]
+        else:
+            X[:, j] = df[c].to_numpy(np.float32, copy=False)
+
+    off = len(NUM_COLS)
+    rail = df.rail.to_numpy()
+    for k in range(len(RAIL_NAMES)):
+        X[:, off + k] = (rail == k)
+
+    off += len(RAIL_NAMES)
+    mcat = df.merchant_cat.to_numpy()
+    for k, cat in enumerate(MERCHANT_CATS):
+        X[:, off + k] = (mcat == cat)
+
+    return X, names
 
 
 class MLPPreprocessor:
@@ -79,11 +89,20 @@ class MLPPreprocessor:
 
     @staticmethod
     def local_stats(X: np.ndarray) -> dict:
-        X = np.asarray(X, dtype=np.float64)
-        valid = np.isfinite(X)
-        cnt = valid.sum(axis=0).astype(np.int64)
-        clean = np.where(valid, X, 0.0)
-        return {"count": cnt, "sum": clean.sum(axis=0), "sum_sq": (clean * clean).sum(axis=0)}
+        X = np.asarray(X)
+        n_cols = X.shape[1] if X.ndim == 2 else 0
+        cnt = np.zeros(n_cols, dtype=np.int64)
+        s = np.zeros(n_cols, dtype=np.float64)
+        sq = np.zeros(n_cols, dtype=np.float64)
+        for j in range(n_cols):
+            col = np.asarray(X[:, j], dtype=np.float64)
+            valid = np.isfinite(col)
+            cnt[j] = int(valid.sum())
+            if cnt[j] > 0:
+                vals = col[valid]
+                s[j] = float(vals.sum())
+                sq[j] = float(np.dot(vals, vals))
+        return {"count": cnt, "sum": s, "sum_sq": sq}
 
     def fit(self, X: np.ndarray) -> "MLPPreprocessor":
         return self.fit_from_stats([self.local_stats(X)])
@@ -103,9 +122,16 @@ class MLPPreprocessor:
 
     def transform(self, X: np.ndarray) -> np.ndarray:
         assert self.mean_ is not None and self.std_ is not None, "call fit() first"
-        X = np.asarray(X, dtype=np.float64)
-        filled = np.where(np.isfinite(X), X, self.mean_)
-        z = (filled - self.mean_) / self.std_
-        if self.clip is not None:
-            z = np.clip(z, -self.clip, self.clip)
-        return z.astype(np.float32)
+        out = np.array(X, dtype=np.float32, copy=True)
+        mean32 = self.mean_.astype(np.float32)
+        inv_std32 = (1.0 / self.std_).astype(np.float32)
+        for j in range(out.shape[1]):
+            col = out[:, j]
+            bad = ~np.isfinite(col)
+            if bad.any():
+                col[bad] = mean32[j]
+            col -= mean32[j]
+            col *= inv_std32[j]
+            if self.clip is not None:
+                np.clip(col, -self.clip, self.clip, out=col)
+        return out
