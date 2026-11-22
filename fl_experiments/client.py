@@ -68,6 +68,12 @@ class FraudClient:
         self.keys = M.mlp_keys(M.make_mlp(self.in_dim)) if model_type == "mlp" else None
         self._xgb_dtrain = None  # lazily cached xgboost.DMatrix (omitted on pickle)
 
+    def release_train_buffers(self):
+        """Free training feature matrices & cached DMatrix once FL training finishes."""
+        self._xgb_dtrain = None
+        if "train" in self.X:
+            self.X["train"] = np.empty((0, 0), dtype=np.float32)
+
     def __getstate__(self):
         st = self.__dict__.copy()
         st["_xgb_dtrain"] = None

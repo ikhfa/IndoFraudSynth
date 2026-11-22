@@ -135,6 +135,13 @@ def run_baselines(pooled, clients, model_types, dataset="indofraud",
             s_by_silo=r_silo,
         )
 
+    # Pooled DataFrames are no longer needed once Xtr/Xva/Xte and rules are built;
+    # release them before XGBoost/CatBoost/MLP allocate large training buffers.
+    import gc
+    if isinstance(pooled, dict):
+        pooled.clear()
+    gc.collect()
+
     cent_val_scores: dict[str, np.ndarray] = {}
     cent_test_scores: dict[str, np.ndarray] = {}
     cent_silo_scores: dict[str, dict[str, np.ndarray]] = {}
@@ -145,8 +152,8 @@ def run_baselines(pooled, clients, model_types, dataset="indofraud",
     local_val_amt: dict[str, np.ndarray] = {}
     local_test_amt: dict[str, np.ndarray] = {}
 
+    # Pass 1: Centralized baselines (then free Xtr/Xva/Xte before local-only loop)
     for mt in model_types:
-        mt_clients = clients[mt] if is_nested and mt in clients else clients
         silo_pred = None
         if mt == "xgboost":
             bst = M.train_xgb(Xtr, ytr, cent_iters, seed=seed,
@@ -197,7 +204,6 @@ def run_baselines(pooled, clients, model_types, dataset="indofraud",
             )
             results["centralized"][mt]["best_epoch"] = int(getattr(model, "best_epoch_", cent_epochs))
             del Xtr_s, Xva_s, Xte_s
-            import gc
             gc.collect()
 
         cent_val_scores[mt] = sv
@@ -205,8 +211,13 @@ def run_baselines(pooled, clients, model_types, dataset="indofraud",
         if silo_pred is not None:
             cent_silo_scores[mt] = silo_pred
 
-        # local-only: each silo trains completely isolated (local scaler, local early stopping,
-        # local cost threshold, matching centralized iteration budget — zero cross-silo info).
+    del Xtr, Xva, Xte
+    silo_Xte_raw.clear()
+    gc.collect()
+
+    # Pass 2: local-only baselines (each silo trains completely isolated)
+    for mt in model_types:
+        mt_clients = clients[mt] if is_nested and mt in clients else clients
         per_silo = {}
         ys_loc, ss_loc, amts_loc, flags_loc = [], [], [], []
         total_cost, total_loss = 0.0, 0.0
@@ -315,7 +326,7 @@ def run_baselines(pooled, clients, model_types, dataset="indofraud",
         ens_te = post_c.predict(ens_te_raw) if post_c is not None else ens_te_raw
         ens_silo = None
         if all(m in cent_silo_scores for m in models_present):
-            silo_list = list(silo_Xte_raw.keys())
+            silo_list = list(cent_silo_scores[models_present[0]].keys())
             cal_silo_by_m = {
                 m: {nm: (cals[m]["pooled"].predict(cent_silo_scores[m][nm])
                          if cals[m]["pooled"] is not None else cent_silo_scores[m][nm])

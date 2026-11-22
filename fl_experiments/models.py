@@ -90,14 +90,28 @@ def train_xgb(X, y, num_rounds, xgb_model=None, params=None, seed=42,
     if want_cuda:
         p["device"] = "cuda"
 
-    dm = dtrain if dtrain is not None else xgb.DMatrix(X, label=y)
+    if dtrain is not None:
+        dm = dtrain
+    elif p.get("tree_method") == "hist" and xgb_model is None:
+        try:
+            dm = xgb.QuantileDMatrix(X, label=y)
+        except Exception:
+            dm = xgb.DMatrix(X, label=y)
+    else:
+        dm = xgb.DMatrix(X, label=y)
     dval = None
     use_es = False
     if eval_set is not None and early_stopping_rounds:
         Xva, yva = eval_set
         yva_arr = np.asarray(yva)
         if 0 < yva_arr.sum() < len(yva_arr):
-            dval = xgb.DMatrix(Xva, label=yva_arr)
+            if isinstance(dm, xgb.QuantileDMatrix):
+                try:
+                    dval = xgb.QuantileDMatrix(Xva, label=yva_arr, ref=dm)
+                except Exception:
+                    dval = xgb.DMatrix(Xva, label=yva_arr)
+            else:
+                dval = xgb.DMatrix(Xva, label=yva_arr)
             use_es = True
 
     def _fit(fit_params):

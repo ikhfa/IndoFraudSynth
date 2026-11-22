@@ -594,6 +594,12 @@ def main():
 
     cores_by_mt = {mt: {c.name: c for c in lst} for mt, lst in cores.items()}
 
+    # Release per-client training arrays & cached XGBoost DMatrices before baselines/eval
+    for lst in cores.values():
+        for c in lst:
+            c.release_train_buffers()
+    gc.collect()
+
     if not args.no_baselines:
         print("Running centralized + local-only baselines ...")
         results["baselines"] = run_baselines(
