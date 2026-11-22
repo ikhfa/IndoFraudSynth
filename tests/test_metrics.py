@@ -151,3 +151,50 @@ def test_exact_cost_threshold_rare_tail_and_medium_silo_platt():
     assert methods["xgb"]["s_med"] == "platt"
     pred_med = cals["xgb"]["s_med"].predict(s_med)
     assert np.isclose(ap(y_med, pred_med), ap(y_med, s_med), atol=1e-6)
+
+
+def test_logit_blend_and_post_global_platt_calibration():
+    """Verify calibrated log-odds blending beats linear prob averaging on rare-event
+    complementary models and post-blend global Platt preserves exact AP while lowering ECE."""
+    from scipy.special import expit
+    from fl_experiments.ensemble import (
+        combine_scores_logit, fit_global_post_calibrator, search_weights,
+    )
+
+    rng = np.random.default_rng(77)
+    n_neg, n_pos = 12_000, 30  # 0.25% rare fraud
+    y = np.array([0] * n_neg + [1] * n_pos, dtype=np.int8)
+    # Two complementary models in the rare-event regime: each occasionally fires false
+    # alarms on negatives that the other model strongly rejects (~1e-4), where linear
+    # probability averaging acts like soft-OR while log-odds blending rejects them.
+    z1 = np.where(y == 1, rng.normal(-1.5, 1.3, len(y)), rng.normal(-6.2, 2.2, len(y)))
+    z2 = np.where(y == 1, rng.normal(-1.5, 1.3, len(y)), rng.normal(-6.2, 2.2, len(y)))
+    p1 = expit(z1)
+    p2 = expit(z2)
+
+    # Split positives across both silos cleanly
+    idx1 = np.concatenate([np.arange(0, 6000), np.arange(n_neg, n_neg + 15)])
+    idx2 = np.concatenate([np.arange(6000, n_neg), np.arange(n_neg + 15, n_neg + n_pos)])
+    s_val = {"m1": {"s1": p1[idx1], "s2": p1[idx2]}, "m2": {"s1": p2[idx1], "s2": p2[idx2]}}
+    y_val = {"s1": y[idx1], "s2": y[idx2]}
+
+    w_lin, _ = search_weights(s_val, y_val, n_draws=100, seed=42, logit_space=False)
+    w_lg, _ = search_weights(s_val, y_val, n_draws=100, seed=42, logit_space=True)
+    lin_all = np.concatenate([w_lin["m1"] * s_val["m1"][s] + w_lin["m2"] * s_val["m2"][s] for s in ("s1", "s2")])
+    lg_map = combine_scores_logit(s_val, w_lg, silos=["s1", "s2"])
+    lg_all = np.concatenate([lg_map[s] for s in ("s1", "s2")])
+    y_all = np.concatenate([y_val["s1"], y_val["s2"]])
+
+    # Log-odds blend must strictly beat linear prob averaging on rare-event AP
+    assert ap(y_all, lg_all) > ap(y_all, lin_all) + 0.05
+
+    # Post-blend global Platt must preserve exact pooled & per-silo AP and keep valid probabilities
+    post_cal, oof_map = fit_global_post_calibrator(lg_map, y_val, seed=42)
+    assert post_cal is not None
+    post_all = np.concatenate([post_cal.predict(lg_map[s]) for s in ("s1", "s2")])
+    assert np.isclose(ap(y_all, post_all), ap(y_all, lg_all), atol=1e-6)
+    assert ece(y_all, post_all) <= ece(y_all, lg_all) + 1e-4
+    for s in ("s1", "s2"):
+        assert np.isfinite(oof_map[s]).all()
+        assert (oof_map[s] >= 0.0).all() and (oof_map[s] <= 1.0).all()
+

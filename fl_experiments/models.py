@@ -165,13 +165,14 @@ def cat_params(iterations, seed=42):
     return dict(
         loss_function="Logloss", iterations=iterations, depth=6, learning_rate=0.1,
         l2_leaf_reg=5, bootstrap_type="Bernoulli", subsample=0.8,
+        boosting_type="Plain", leaf_estimation_iterations=10,
         allow_writing_files=False, thread_count=resolve_n_jobs(), verbose=False, random_seed=seed,
     )
 
 
 def train_cat(X, y, iterations, init_model_path=None, seed=42,
-              eval_set=None, early_stopping_rounds=None):
-    from catboost import CatBoostClassifier
+              eval_set=None, early_stopping_rounds=None, baseline=None):
+    from catboost import CatBoostClassifier, Pool
     kw = cat_params(iterations, seed)
     use_es = False
     if eval_set is not None and early_stopping_rounds:
@@ -181,7 +182,10 @@ def train_cat(X, y, iterations, init_model_path=None, seed=42,
             kw["eval_metric"] = "PRAUC"
             use_es = True
     model = CatBoostClassifier(**kw)
-    if use_es:
+    if baseline is not None:
+        train_pool = Pool(X, y, baseline=np.asarray(baseline, dtype=np.float64))
+        model.fit(train_pool, verbose=False)
+    elif use_es:
         model.fit(
             X, y, init_model=init_model_path, eval_set=eval_set,
             use_best_model=True, early_stopping_rounds=early_stopping_rounds,
@@ -190,6 +194,10 @@ def train_cat(X, y, iterations, init_model_path=None, seed=42,
     else:
         model.fit(X, y, init_model=init_model_path, verbose=False)
     return model
+
+
+def cat_predict_raw_loaded(model, X) -> np.ndarray:
+    return np.asarray(model.predict(X, prediction_type="RawFormulaVal"), dtype=np.float64)
 
 
 def cat_to_bytes(model) -> bytes:

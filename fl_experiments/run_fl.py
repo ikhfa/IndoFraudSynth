@@ -59,21 +59,18 @@ def run_local_engine(cores, model_type, rounds, normalize, budget,
     for r in range(1, rounds + 1):
         t0 = time.perf_counter()
         if model_type == "catboost" and r > 1 and payload is not None:
-            # Write global.cbm once per round instead of once per client.
-            with tempfile.TemporaryDirectory() as td:
-                cbm_path = os.path.join(td, "global.cbm")
-                with open(cbm_path, "wb") as f:
-                    f.write(payload)
-                fits = [
-                    c.fit(
-                        payload, r,
-                        t0_override=None,
-                        local_iters_override=eff_local_iters,
-                        n_prev=n_prev,
-                        init_model_path=cbm_path,
-                    )
-                    for c in cores
-                ]
+            # Deserialize global CatBoost model once per round for baseline margin computation.
+            g_cat = M.bytes_to_cat(payload)
+            fits = [
+                c.fit(
+                    payload, r,
+                    t0_override=None,
+                    local_iters_override=eff_local_iters,
+                    n_prev=n_prev,
+                    loaded_global=g_cat,
+                )
+                for c in cores
+            ]
         else:
             fits = [
                 c.fit(
@@ -382,7 +379,7 @@ def _model_cache_key(args, mt: str, budget: int | None, eff_device: str,
     """Deterministic SHA-256 key capturing every parameter that affects a model's FL weights."""
     silo_sig = [(name, len(fr["train"]), len(fr["val"])) for name, fr in clients_df.items()]
     spec = {
-        "v": 1,
+        "v": 2,
         "dataset": args.dataset,
         "data": os.path.basename(os.path.normpath(args.data)),
         "partition": args.partition,

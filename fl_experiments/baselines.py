@@ -6,7 +6,9 @@ import pandas as pd
 from sklearn.metrics import f1_score
 
 from . import models as M
-from .ensemble import fit_calibrators, search_weights
+from .ensemble import (
+    fit_calibrators, search_weights, combine_scores_logit, fit_global_post_calibrator,
+)
 from .features import build_matrix, MLPPreprocessor
 from .metrics import (
     ap, recall_at_fpr, cost_threshold, fraud_cost, savings, f1_at, bayes_savings,
@@ -287,7 +289,7 @@ def run_baselines(pooled, clients, model_types, dataset="indofraud",
             "per_silo_ap": per_silo,
         }
 
-    # Centralized calibrated ensemble upper bound (apples-to-apples vs federated ensemble)
+    # Centralized calibrated logit-space ensemble upper bound (apples-to-apples vs federated ensemble)
     if len(cent_val_scores) >= 2:
         models_present = list(cent_val_scores.keys())
         cals, cal_methods, cal_val_oof = fit_calibrators(
@@ -295,23 +297,33 @@ def run_baselines(pooled, clients, model_types, dataset="indofraud",
             {"pooled": yva},
             seed=seed,
         )
-        cal_w, cal_val_obj = search_weights(cal_val_oof, {"pooled": yva}, n_draws=300, seed=seed)
-        ens_va = sum(cal_w[m] * cal_val_oof[m]["pooled"] for m in models_present)
-        ens_te = sum(
-            cal_w[m] * (cals[m]["pooled"].predict(cent_test_scores[m])
-                        if cals[m]["pooled"] is not None else cent_test_scores[m])
-            for m in models_present
+        cal_w, cal_val_obj = search_weights(
+            cal_val_oof, {"pooled": yva}, n_draws=300, seed=seed, logit_space=True
         )
+        ens_va_raw = combine_scores_logit(cal_val_oof, cal_w, silos=["pooled"])
+        cal_te_by_m = {
+            m: {"pooled": (cals[m]["pooled"].predict(cent_test_scores[m])
+                           if cals[m]["pooled"] is not None else cent_test_scores[m])}
+            for m in models_present
+        }
+        ens_te_raw = combine_scores_logit(cal_te_by_m, cal_w, silos=["pooled"])["pooled"]
+        post_c, ens_va_oof = fit_global_post_calibrator(ens_va_raw, {"pooled": yva}, seed=seed)
+        ens_va = ens_va_oof["pooled"]
+        ens_te = post_c.predict(ens_te_raw) if post_c is not None else ens_te_raw
         ens_silo = None
         if all(m in cent_silo_scores for m in models_present):
-            ens_silo = {
-                nm: sum(
-                    cal_w[m] * (cals[m]["pooled"].predict(cent_silo_scores[m][nm])
-                                if cals[m]["pooled"] is not None else cent_silo_scores[m][nm])
-                    for m in models_present
-                )
-                for nm in silo_Xte_raw
+            silo_list = list(silo_Xte_raw.keys())
+            cal_silo_by_m = {
+                m: {nm: (cals[m]["pooled"].predict(cent_silo_scores[m][nm])
+                         if cals[m]["pooled"] is not None else cent_silo_scores[m][nm])
+                    for nm in silo_list}
+                for m in models_present
             }
+            ens_silo_raw = combine_scores_logit(cal_silo_by_m, cal_w, silos=silo_list)
+            ens_silo = (
+                {nm: post_c.predict(ens_silo_raw[nm]) for nm in silo_list}
+                if post_c is not None else ens_silo_raw
+            )
         ens_metrics = _eval_scores(
             yte, ens_te, ate, yva, ens_va, ava, c_fp,
             y_by_silo=(silo_yte if ens_silo is not None else None),
@@ -322,7 +334,7 @@ def run_baselines(pooled, clients, model_types, dataset="indofraud",
         ens_metrics["calibration_methods"] = {m: cal_methods[m]["pooled"] for m in models_present}
         results["centralized"]["ensemble"] = ens_metrics
 
-    # Local-only calibrated ensemble (strictly silo-local calibration, weights, and thresholds)
+    # Local-only calibrated logit-space ensemble (strictly silo-local calibration, weights, thresholds)
     if len(local_val_scores) >= 2:
         loc_models = list(local_val_scores.keys())
         loc_silos = list(local_test_y.keys())
@@ -334,14 +346,18 @@ def run_baselines(pooled, clients, model_types, dataset="indofraud",
             sv_s = {m: {s: local_val_scores[m][s]} for m in loc_models}
             yv_s = {s: local_val_y[s]}
             cals_s, _, oof_s = fit_calibrators(sv_s, yv_s, seed=seed + s_idx)
-            w_s, _ = search_weights(oof_s, yv_s, n_draws=300, seed=seed + s_idx)
+            w_s, _ = search_weights(oof_s, yv_s, n_draws=300, seed=seed + s_idx, logit_space=True)
             loc_weights[s] = w_s
-            ens_va_s = sum(w_s[m] * oof_s[m][s] for m in loc_models)
-            ens_te_s = sum(
-                w_s[m] * (cals_s[m][s].predict(local_test_scores[m][s])
-                          if cals_s[m][s] is not None else local_test_scores[m][s])
+            ens_va_raw_s = combine_scores_logit(oof_s, w_s, silos=[s])
+            cal_te_s = {
+                m: {s: (cals_s[m][s].predict(local_test_scores[m][s])
+                        if cals_s[m][s] is not None else local_test_scores[m][s])}
                 for m in loc_models
-            )
+            }
+            ens_te_raw_s = combine_scores_logit(cal_te_s, w_s, silos=[s])[s]
+            post_s, ens_va_oof_s = fit_global_post_calibrator(ens_va_raw_s, yv_s, seed=seed + s_idx)
+            ens_va_s = ens_va_oof_s[s]
+            ens_te_s = post_s.predict(ens_te_raw_s) if post_s is not None else ens_te_raw_s
             thr_s, _ = cost_threshold(local_val_y[s], ens_va_s, local_val_amt[s], c_fp)
             fl_s = (ens_te_s >= thr_s).astype(int)
             tot_cost_le += fraud_cost(local_test_y[s], ens_te_s, thr_s, local_test_amt[s], c_fp)

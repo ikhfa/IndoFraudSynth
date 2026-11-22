@@ -161,7 +161,7 @@ class FraudClient:
     # ---------- core FL API ----------
     def fit(self, payload, server_round: int, t0_override: int | None = None,
             local_iters_override: int | None = None, n_prev: int = 0,
-            init_model_path: str | None = None):
+            init_model_path: str | None = None, loaded_global=None):
         cfg = self.cfg
         r1_iters = t0_override if t0_override is not None else cfg.t0
         round_iters = (local_iters_override if local_iters_override is not None
@@ -196,12 +196,20 @@ class FraudClient:
             if server_round == 1 or payload is None:
                 model = M.train_cat(self.X["train"], y_tr, r1_iters, seed=cfg.seed)
                 out = M.cat_to_bytes(model)
+            elif n_prev > 0:
+                # Train delta trees directly on the global model's raw margin baseline:
+                # mathematically identical to init_model + extract_cat_delta, faster,
+                # and avoids passing unioned multi-silo float borders back into CatBoost.
+                g_cat = loaded_global if loaded_global is not None else M.bytes_to_cat(payload)
+                base_margin = M.cat_predict_raw_loaded(g_cat, self.X["train"])
+                model = M.train_cat(self.X["train"], y_tr, round_iters,
+                                    baseline=base_margin, seed=cfg.seed + server_round)
+                out = M.cat_to_bytes(model)
             elif init_model_path is not None and os.path.exists(init_model_path):
                 model = M.train_cat(self.X["train"], y_tr, round_iters,
                                     init_model_path=init_model_path,
                                     seed=cfg.seed + server_round)
-                full_out = M.cat_to_bytes(model)
-                out = extract_cat_delta(full_out, n_prev) if n_prev > 0 else full_out
+                out = M.cat_to_bytes(model)
             else:
                 with tempfile.TemporaryDirectory() as td:
                     p = os.path.join(td, "global.cbm")
@@ -209,8 +217,7 @@ class FraudClient:
                         f.write(payload)
                     model = M.train_cat(self.X["train"], y_tr, round_iters,
                                         init_model_path=p, seed=cfg.seed + server_round)
-                full_out = M.cat_to_bytes(model)
-                out = extract_cat_delta(full_out, n_prev) if n_prev > 0 else full_out
+                out = M.cat_to_bytes(model)
             return out, len(y_tr), {"payload_bytes": len(out)}
 
         if self.model_type == "mlp":

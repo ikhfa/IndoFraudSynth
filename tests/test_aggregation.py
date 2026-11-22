@@ -515,3 +515,60 @@ def test_flower_strategy_aggregate_fit_is_cid_order_invariant(data):
     s1.aggregate_fit(1, items_fwd, [])
     s2.aggregate_fit(1, items_rev, [])
     assert np.allclose(_margins(s1.current, X), _margins(s2.current, X), atol=1e-6)
+
+
+def test_catboost_plain_params_and_baseline_continuation_equivalence(data):
+    """Regression test:
+    1. cat_params must pin boosting_type='Plain' and leaf_estimation_iterations=10
+       so small silos (n <= 50k) and short rounds (<= 100 iters) never silently flip
+       to high-variance Ordered boosting or 1-step leaf estimation.
+    2. Pool(baseline=raw_margin) continuation must match init_model + extract_cat_delta
+       bit-for-bit when merged via merge_cat(..., is_delta=True).
+    """
+    import os, tempfile
+    X, y = data
+    kw = M.cat_params(11, seed=42)
+    assert kw["boosting_type"] == "Plain"
+    assert kw["leaf_estimation_iterations"] == 10
+
+    m1 = M.cat_to_bytes(M.train_cat(X[:300], y[:300], 15, seed=1))
+    m2 = M.cat_to_bytes(M.train_cat(X[300:], y[300:], 15, seed=2))
+    g = merge_cat([m1, m2], normalize=True)
+    n_prev = tree_count("catboost", g)
+    mg = M.bytes_to_cat(g)
+
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "g.cbm")
+        with open(p, "wb") as f:
+            f.write(g)
+        d1_init = extract_cat_delta(
+            M.cat_to_bytes(M.train_cat(X[:300], y[:300], 6, init_model_path=p, seed=3)),
+            n_prev,
+        )
+        d2_init = extract_cat_delta(
+            M.cat_to_bytes(M.train_cat(X[300:], y[300:], 6, init_model_path=p, seed=4)),
+            n_prev,
+        )
+
+    b1 = M.cat_predict_raw_loaded(mg, X[:300])
+    b2 = M.cat_predict_raw_loaded(mg, X[300:])
+    d1_pool = M.cat_to_bytes(M.train_cat(X[:300], y[:300], 6, baseline=b1, seed=3))
+    d2_pool = M.cat_to_bytes(M.train_cat(X[300:], y[300:], 6, baseline=b2, seed=4))
+    assert tree_count("catboost", d1_pool) == 6
+    assert tree_count("catboost", d2_pool) == 6
+
+    g_init = merge_cat([d1_init, d2_init], global_payload=g, normalize=True, n_prev=n_prev, is_delta=True)
+    g_pool = merge_cat([d1_pool, d2_pool], global_payload=g, normalize=True, n_prev=n_prev, is_delta=True)
+    r_init = M.cat_predict_raw_loaded(M.bytes_to_cat(g_init), X)
+    r_pool = M.cat_predict_raw_loaded(M.bytes_to_cat(g_pool), X)
+    # Exact additive residual semantics: merged margin == g + 0.5 * (d1 + d2)
+    r_expect = (
+        M.cat_predict_raw_loaded(mg, X)
+        + 0.5 * M.cat_predict_raw_loaded(M.bytes_to_cat(d1_pool), X)
+        + 0.5 * M.cat_predict_raw_loaded(M.bytes_to_cat(d2_pool), X)
+    )
+    assert np.allclose(r_pool, r_expect, atol=1e-4)
+    # Nearly identical to init_model continuation (differing only at rare local border quantiles)
+    assert np.corrcoef(r_init, r_pool)[0, 1] > 0.999
+    assert float(np.mean(np.abs(r_init - r_pool))) < 0.01
+

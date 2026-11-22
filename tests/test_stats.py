@@ -214,3 +214,76 @@ def test_select_primary_methods_deduplicates_baselines():
         "baseline:weighted_voting",
         "normalized_fedbn:weighted_calibrated_bayes_1pct",
     }
+
+
+def test_run_suite_forwards_acceleration_and_cache_flags(tmp_path, capsys):
+    """Regression test: run_suite must accept and forward --device, --threads,
+    --patience, --mlp-batch-size, --workers, and --no-model-cache (required by
+    Colab/Kaggle notebooks and README)."""
+    from types import SimpleNamespace
+
+    args = SimpleNamespace(
+        config="configs/default.yaml",
+        data="data/full",
+        dataset="indofraud",
+        engine="local",
+        models="xgboost,catboost,mlp",
+        k=10,
+        rounds=10,
+        patience=3,
+        split="temporal",
+        train_cap=200000,
+        device="cuda",
+        threads=4,
+        mlp_batch_size=4096,
+    )
+    cache_dir = str(tmp_path / "_model_cache")
+    cmd = build_run_cmd(
+        args, "dirichlet", 0.5, "normalized_fedbn", 7, str(tmp_path / "run"),
+        run_baselines=False, model_cache_dir=cache_dir,
+    )
+    for flag, val in [
+        ("--patience", "3"),
+        ("--train-cap", "200000"),
+        ("--device", "cuda"),
+        ("--threads", "4"),
+        ("--mlp-batch-size", "4096"),
+        ("--model-cache-dir", cache_dir),
+        ("--alpha", "0.5"),
+    ]:
+        assert flag in cmd, f"missing {flag} in {cmd}"
+        assert cmd[cmd.index(flag) + 1] == val
+    assert "--no-baselines" in cmd
+
+    # Verify CLI dry-run accepts notebook arguments, enables _model_cache by default,
+    # and disables it under --no-model-cache.
+    old = sys.argv
+    try:
+        sys.argv = [
+            "run_suite", "--config", "configs/quick.yaml",
+            "--device", "auto", "--threads", "2", "--patience", "3",
+            "--mlp-batch-size", "4096", "--workers", "2",
+            "--seeds", "1", "--conditions", "baseline,normalized_fedbn",
+            "--partitions", "profile", "--out", str(tmp_path / "s_cached"), "--dry-run",
+        ]
+        from fl_experiments.run_suite import main
+        main()
+        out_cached = capsys.readouterr().out
+        assert "--model-cache-dir" in out_cached
+        assert "--device auto" in out_cached
+        assert "--patience 3" in out_cached
+        assert "--mlp-batch-size 4096" in out_cached
+
+        sys.argv = [
+            "run_suite", "--config", "configs/quick.yaml",
+            "--device", "cpu", "--workers", "2", "--no-model-cache",
+            "--seeds", "1", "--conditions", "baseline",
+            "--partitions", "profile", "--out", str(tmp_path / "s_nocache"), "--dry-run",
+        ]
+        main()
+        out_nocache = capsys.readouterr().out
+        assert "--model-cache-dir" not in out_nocache
+        assert "--threads" in out_nocache
+    finally:
+        sys.argv = old
+

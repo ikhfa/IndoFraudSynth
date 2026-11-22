@@ -159,15 +159,102 @@ def _macro_ap(scores_by_silo, y_by_silo):
     return float(np.mean(vals)) if vals else float("nan")
 
 
-def search_weights(val_scores, y_vals, n_draws=300, seed=42):
+def _to_logit(scores: np.ndarray) -> np.ndarray:
+    p = np.clip(np.asarray(scores, dtype=np.float64), 1e-15, 1.0 - 1e-15)
+    return np.log(p / (1.0 - p))
+
+
+def combine_scores_logit(scores_by_m: dict[str, dict[str, np.ndarray]],
+                         weights: dict[str, float],
+                         silos: list[str] | None = None) -> dict[str, np.ndarray]:
+    """Calibrated log-odds (log-linear opinion pool) ensemble blend:
+    `p_ens = sigmoid(sum_m w_m * logit(p_m))`.
+
+    Under severe fraud imbalance (p ~ 1e-3), linear probability averaging acts
+    like a soft-OR that ignores strong negative evidence from complementary
+    models and amplifies Platt tail-softening distortion. Blending calibrated
+    log-odds is multiplicative in odds and preserves rare-event ranking.
+    """
+    models = list(weights.keys())
+    if silos is None:
+        silos = list(scores_by_m[models[0]].keys())
+    return {
+        s: expit(sum(weights[m] * _to_logit(scores_by_m[m][s]) for m in models))
+        for s in silos
+    }
+
+
+def fit_global_post_calibrator(val_scores_by_silo: dict[str, np.ndarray],
+                               y_vals: dict[str, np.ndarray],
+                               seed: int = 42):
+    """FL-safe 2-parameter post-blend global Platt recalibrator.
+
+    Blending correlated calibrated logits can slightly under-disperse output
+    probabilities; fitting a single global monotonic Platt map `(a_ens, b_ens)`
+    across silos (2 floats + 1 int shared/silo) restores sharp probability
+    calibration (ECE / Bayes@1%) while preserving 100% of pooled & macro AP
+    rankings. Returns `(calibrator_or_None, oof_val_scores_by_silo)`.
+    """
+    silos = list(val_scores_by_silo.keys())
+    local_platt: dict[str, tuple[float, float, int]] = {}
+    for s in silos:
+        y = np.asarray(y_vals[s], dtype=int)
+        sc = np.asarray(val_scores_by_silo[s], dtype=np.float64)
+        pos = int(y.sum())
+        neg = int(len(y) - pos)
+        if pos >= 5 and neg >= 5:
+            cal = PlattCalibrator().fit(sc, y)
+            local_platt[s] = (cal.slope_, cal.intercept_, pos)
+
+    global_ab = _agg_platt_params(local_platt, exclude=None)
+    if global_ab is None:
+        return None, {s: np.asarray(val_scores_by_silo[s], dtype=np.float64).copy() for s in silos}
+
+    post_cal = PlattCalibrator.from_params(global_ab[0], global_ab[1])
+    oof: dict[str, np.ndarray] = {}
+    for s in silos:
+        sc = np.asarray(val_scores_by_silo[s], dtype=np.float64)
+        y = np.asarray(y_vals[s], dtype=int)
+        if len(silos) >= 2:
+            other_ab = _agg_platt_params(local_platt, exclude=s)
+            if other_ab is not None:
+                oof[s] = PlattCalibrator.from_params(other_ab[0], other_ab[1]).predict(sc)
+            else:
+                oof[s] = post_cal.predict(sc)
+        else:
+            pos = int(y.sum())
+            neg = int(len(y) - pos)
+            n_splits = min(3, pos, neg)
+            if n_splits >= 2:
+                skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+                pred = np.empty_like(sc, dtype=np.float64)
+                for tr, va in skf.split(sc.reshape(-1, 1), y):
+                    pos_tr = int(y[tr].sum())
+                    neg_tr = int(len(y[tr]) - pos_tr)
+                    if pos_tr >= 2 and neg_tr >= 2:
+                        pred[va] = PlattCalibrator().fit(sc[tr], y[tr]).predict(sc[va])
+                    else:
+                        pred[va] = sc[va]
+                oof[s] = pred
+            else:
+                oof[s] = post_cal.predict(sc)
+    return post_cal, oof
+
+
+def search_weights(val_scores, y_vals, n_draws=300, seed=42, logit_space: bool = False):
     models = list(val_scores.keys())
     silos = list(y_vals.keys())
     rng = np.random.default_rng(seed)
 
+    if logit_space:
+        score_src = {m: {s: _to_logit(val_scores[m][s]) for s in silos} for m in models}
+    else:
+        score_src = val_scores
+
     def objective(w):
         per_silo = {}
         for s in silos:
-            per_silo[s] = sum(w[i] * val_scores[m][s] for i, m in enumerate(models))
+            per_silo[s] = sum(w[i] * score_src[m][s] for i, m in enumerate(models))
         v = _macro_ap(per_silo, y_vals)
         return 0.0 if np.isnan(v) else v
 
@@ -192,7 +279,7 @@ def search_weights(val_scores, y_vals, n_draws=300, seed=42):
     return {m: float(w) for m, w in zip(models, best_w)}, float(best_v)
 
 
-def fit_calibrators(val_scores, y_vals, seed: int = 42, prior_strength: float = 15.0):
+def fit_calibrators(val_scores, y_vals, seed: int = 42, prior_strength: float = 100.0):
     """Per-silo calibration with FL-safe hierarchical Platt shrinkage & global fallback.
 
     - Silos with >=500 positives use Isotonic regression (locking the same family in OOF).
@@ -353,30 +440,38 @@ def evaluate_ensemble(clients, payloads, c_fp=7500.0, seed=42, n_draws=300,
     y_vals = {s: c.y["val"] for s, c in ref_clients.items()}
     models = list(payloads.keys())
 
-    # 1. Baseline uncalibrated ensemble weights (source-paper replication)
-    weights, val_obj = search_weights(val_scores, y_vals, n_draws, seed)
+    # 1. Baseline uncalibrated ensemble weights (source-paper replication: linear prob space)
+    weights, val_obj = search_weights(val_scores, y_vals, n_draws, seed, logit_space=False)
 
-    # 2. Proposed per-silo calibration (OOF on val) BEFORE weight search so all
-    # heterogeneous models sit on a common calibrated probability scale.
+    # 2. Proposed per-silo calibration (OOF on val) BEFORE logit-space weight search
+    # so all heterogeneous models are combined on a calibrated log-odds scale, followed
+    # by a rank-preserving 2-parameter FL-safe global Platt recalibrator.
     cals, cal_methods, cal_val_oof = fit_calibrators(val_scores, y_vals, seed=seed)
-    cal_weights, cal_val_obj = search_weights(cal_val_oof, y_vals, n_draws, seed)
+    cal_weights, cal_val_obj = search_weights(cal_val_oof, y_vals, n_draws, seed, logit_space=True)
+
+    silo_list = list(ref_clients.keys())
 
     def combine(scores, w):
-        return {s: sum(w[m] * scores[m][s] for m in models) for s in ref_clients}
+        return {s: sum(w[m] * scores[m][s] for m in models) for s in silo_list}
 
     soft_val = combine(val_scores, {m: 1 / len(models) for m in models})
     soft_test = combine(test_scores, {m: 1 / len(models) for m in models})
     w_val = combine(val_scores, weights)
     w_test = combine(test_scores, weights)
 
-    cal_val = combine(cal_val_oof, cal_weights)
+    cal_val_raw = combine_scores_logit(cal_val_oof, cal_weights, silos=silo_list)
     cal_test_by_m = {
         m: {s: (cals[m][s].predict(test_scores[m][s])
                 if cals[m][s] is not None else test_scores[m][s])
-            for s in ref_clients}
+            for s in silo_list}
         for m in models
     }
-    cal_test = combine(cal_test_by_m, cal_weights)
+    cal_test_raw = combine_scores_logit(cal_test_by_m, cal_weights, silos=silo_list)
+    post_cal, cal_val = fit_global_post_calibrator(cal_val_raw, y_vals, seed=seed)
+    cal_test = (
+        {s: post_cal.predict(cal_test_raw[s]) for s in silo_list}
+        if post_cal is not None else cal_test_raw
+    )
     if out_plot_scores is not None:
         out_plot_scores["weighted"] = w_test
         out_plot_scores["calibrated"] = cal_test
@@ -428,15 +523,22 @@ def evaluate_ensemble(clients, payloads, c_fp=7500.0, seed=42, n_draws=300,
         cal_test, ref_clients, None, c_fp, use_bayes=True, max_alert_rate=0.01
     )
 
-    # 2-model calibrated ensemble ablations (when >= 3 models are present)
+    # 2-model calibrated logit-space ensemble ablations (when >= 3 models are present)
     ablations_2model = {}
     if len(models) >= 3:
         from itertools import combinations
         for pair in combinations(models, 2):
             sub_oof = {m: cal_val_oof[m] for m in pair}
-            sub_w, sub_obj = search_weights(sub_oof, y_vals, n_draws, seed)
-            sub_val = {s: sum(sub_w[m] * cal_val_oof[m][s] for m in pair) for s in ref_clients}
-            sub_test = {s: sum(sub_w[m] * cal_test_by_m[m][s] for m in pair) for s in ref_clients}
+            sub_w, sub_obj = search_weights(sub_oof, y_vals, n_draws, seed, logit_space=True)
+            sub_val_raw = combine_scores_logit(sub_oof, sub_w, silos=silo_list)
+            sub_test_raw = combine_scores_logit(
+                {m: cal_test_by_m[m] for m in pair}, sub_w, silos=silo_list
+            )
+            sub_post, sub_val = fit_global_post_calibrator(sub_val_raw, y_vals, seed=seed)
+            sub_test = (
+                {s: sub_post.predict(sub_test_raw[s]) for s in silo_list}
+                if sub_post is not None else sub_test_raw
+            )
             sub_thr = _per_silo_thresholds(sub_val)
             key = "+".join(pair)
             ablations_2model[key] = {
