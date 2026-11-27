@@ -21,6 +21,7 @@ import os
 import subprocess
 import sys
 
+from .plots import generate_all_figures, plot_skew_degradation
 from .stats import load_suite_dir, analyze_runs
 
 
@@ -121,6 +122,8 @@ def main():
     ap.add_argument("--out", default="results/suite")
     ap.add_argument("--skip-existing", action="store_true",
                     help="Skip runs whose results.json already exists")
+    ap.add_argument("--no-figures", action="store_true",
+                    help="Skip automatic publication figure generation (fig1..fig6)")
     ap.add_argument("--dry-run", action="store_true", help="Print commands without executing")
     args = ap.parse_args()
 
@@ -184,6 +187,35 @@ def main():
                 analyze_runs(runs, part_dir, primary_metric=args.metric,
                              alpha=args.alpha, scope=args.scope)
                 print(f"[stats] Wrote summary.md / table.tex / cd_diagram.png -> {part_dir}")
+                if not args.no_figures:
+                    try:
+                        figs = generate_all_figures(part_dir)
+                        print(f"[plots] Generated {len(figs)} figure files -> {os.path.join(part_dir, 'figures')}")
+                    except Exception as exc:
+                        print(f"[plots] Skipped per-partition figures for {part_dir}: {exc}")
+
+    # Cross-partition pooled statistics + RQ1 skew-degradation figure (fig6)
+    if not args.dry_run:
+        pooled_runs = load_suite_dir(args.out)
+        # Only emit suite-root pooled stats & fig6 when multiple partition subdirs exist
+        part_tags_present = {
+            str(blk).split(":", 1)[0] for _, blk, _ in pooled_runs if ":" in str(blk)
+        }
+        if len(part_tags_present) >= 2:
+            analyze_runs(pooled_runs, args.out, primary_metric=args.metric,
+                         alpha=args.alpha, scope=args.scope)
+            print(f"[stats] Wrote pooled ({len(part_tags_present)} partitions, {args.metric}) -> {args.out}")
+            if args.metric != "macro_ap":
+                macro_dir = os.path.join(args.out, "stats_macro_ap")
+                analyze_runs(pooled_runs, macro_dir, primary_metric="macro_ap",
+                             alpha=args.alpha, scope=args.scope)
+                print(f"[stats] Wrote pooled ({len(part_tags_present)} partitions, macro_ap) -> {macro_dir}")
+            if not args.no_figures:
+                try:
+                    figs6 = plot_skew_degradation(args.out)
+                    print(f"[plots] Generated {len(figs6)} cross-partition figure files -> {os.path.join(args.out, 'figures')}")
+                except Exception as exc:
+                    print(f"[plots] Skipped cross-partition fig6 for {args.out}: {exc}")
 
 
 if __name__ == "__main__":

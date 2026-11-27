@@ -185,32 +185,50 @@ def plot_main_comparison(data: dict[str, dict[int, dict]], out_dir: str):
     if not seeds:
         return
 
+    def _has_cond_all(ckey: str) -> bool:
+        return ckey in data and all(s in data[ckey] for s in seeds)
+
     def _collect(extractor):
         vals = [extractor(s) for s in seeds]
         return mean_ci95(vals)
 
-    methods_bar = [
-        ("Local-Only\nEnsemble",
-         lambda s: anchors[s]["baselines"]["local_only"]["ensemble"]["pooled_ap"],
-         lambda s: anchors[s]["baselines"]["local_only"]["ensemble"]["macro_ap"],
-         PALETTE["local_only"]),
-        ("Baseline FL\n(WV)",
-         lambda s: data["baseline"][s]["ensemble"]["variants"]["weighted_voting"]["pooled_ap"],
-         lambda s: data["baseline"][s]["ensemble"]["variants"]["weighted_voting"]["macro_ap"],
-         PALETTE["baseline"]),
-        ("Baseline FL\n(+Cal/Bayes)",
-         lambda s: data["baseline"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["pooled_ap"],
-         lambda s: data["baseline"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["macro_ap"],
-         PALETTE["baseline_cal"]),
-        ("Proposed\nUniform+FedBN",
-         lambda s: data["normalized_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["pooled_ap"],
-         lambda s: data["normalized_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["macro_ap"],
-         PALETTE["norm_fedbn"]),
-        ("Proposed\nSize+FedBN",
-         lambda s: data["normalized_size_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["pooled_ap"],
-         lambda s: data["normalized_size_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["macro_ap"],
-         PALETTE["norm_size_fedbn"]),
-    ]
+    methods_bar = []
+    if all("local_only" in anchors[s]["baselines"] and "ensemble" in anchors[s]["baselines"]["local_only"] for s in seeds):
+        methods_bar.append((
+            "Local-Only\nEnsemble",
+            lambda s: anchors[s]["baselines"]["local_only"]["ensemble"]["pooled_ap"],
+            lambda s: anchors[s]["baselines"]["local_only"]["ensemble"]["macro_ap"],
+            PALETTE["local_only"],
+        ))
+    if _has_cond_all("baseline"):
+        methods_bar.append((
+            "Baseline FL\n(WV)",
+            lambda s: data["baseline"][s]["ensemble"]["variants"]["weighted_voting"]["pooled_ap"],
+            lambda s: data["baseline"][s]["ensemble"]["variants"]["weighted_voting"]["macro_ap"],
+            PALETTE["baseline"],
+        ))
+        methods_bar.append((
+            "Baseline FL\n(+Cal/Bayes)",
+            lambda s: data["baseline"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["pooled_ap"],
+            lambda s: data["baseline"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["macro_ap"],
+            PALETTE["baseline_cal"],
+        ))
+    if _has_cond_all("normalized_fedbn"):
+        methods_bar.append((
+            "Proposed\nUniform+FedBN",
+            lambda s: data["normalized_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["pooled_ap"],
+            lambda s: data["normalized_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["macro_ap"],
+            PALETTE["norm_fedbn"],
+        ))
+    if _has_cond_all("normalized_size_fedbn"):
+        methods_bar.append((
+            "Proposed\nSize+FedBN",
+            lambda s: data["normalized_size_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["pooled_ap"],
+            lambda s: data["normalized_size_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["macro_ap"],
+            PALETTE["norm_size_fedbn"],
+        ))
+    if not methods_bar:
+        return
 
     cent_pooled = _collect(lambda s: anchors[s]["baselines"]["centralized"]["ensemble"]["pooled_ap"])
     cent_macro = _collect(lambda s: anchors[s]["baselines"]["centralized"]["ensemble"]["macro_ap"])
@@ -261,40 +279,56 @@ def plot_main_comparison(data: dict[str, dict[int, dict]], out_dir: str):
     ax1.legend(handles=leg_elems, loc="upper center", ncol=2, fontsize=7.5)
 
     # Panel (b): IDR Savings vs Alert Rate (Operational Efficiency Frontier)
-    frontier_pts = [
-        ("Local-Only (Flat Thr)",
-         lambda s: 100 * anchors[s]["baselines"]["local_only"]["ensemble"]["alert_rate"],
-         lambda s: 100 * anchors[s]["baselines"]["local_only"]["ensemble"]["savings"],
-         PALETTE["local_only"], "D", (1.62, 93.45), "center"),
-        ("Centralized (Flat Thr)",
-         lambda s: 100 * anchors[s]["baselines"]["centralized"]["ensemble"]["alert_rate"],
-         lambda s: 100 * anchors[s]["baselines"]["centralized"]["ensemble"]["savings"],
-         PALETTE["centralized"], "*", (1.76, 95.95), "center"),
-        ("Baseline FL (WV)",
-         lambda s: 100 * data["baseline"][s]["ensemble"]["variants"]["weighted_voting"]["alert_rate"],
-         lambda s: 100 * data["baseline"][s]["ensemble"]["variants"]["weighted_voting"]["savings"],
-         PALETTE["baseline"], "o", (1.28, 94.38), "center"),
-        ("Baseline FL\n(Bayes@1%)",
-         lambda s: 100 * data["baseline"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["alert_rate"],
-         lambda s: 100 * data["baseline"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["savings"],
-         PALETTE["baseline_cal"], "o", (0.78, 93.72), "center"),
-        ("Proposed Size+FedBN\n(WV Flat Thr)",
-         lambda s: 100 * data["normalized_size_fedbn"][s]["ensemble"]["variants"]["weighted_voting"]["alert_rate"],
-         lambda s: 100 * data["normalized_size_fedbn"][s]["ensemble"]["variants"]["weighted_voting"]["savings"],
-         PALETTE["sky"], "^", (2.02, 94.55), "center"),
-        ("Proposed Uniform+FedBN\n(Bayes@1%)",
-         lambda s: 100 * data["normalized_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["alert_rate"],
-         lambda s: 100 * data["normalized_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["savings"],
-         PALETTE["norm_fedbn"], "s", (1.06, 95.72), "left"),
-        ("Proposed Size+FedBN\n(Bayes@1%)",
-         lambda s: 100 * data["normalized_size_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["alert_rate"],
-         lambda s: 100 * data["normalized_size_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["savings"],
-         PALETTE["norm_size_fedbn"], "^", (1.06, 96.45), "left"),
-        ("Proposed Size+FedBN\n(Bayes Uncapped)",
-         lambda s: 100 * data["normalized_size_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes"]["alert_rate"],
-         lambda s: 100 * data["normalized_size_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes"]["savings"],
-         PALETTE["norm_size_fedbn"], "P", (1.62, 97.26), "center"),
-    ]
+    frontier_pts = []
+    if all("local_only" in anchors[s]["baselines"] and "ensemble" in anchors[s]["baselines"]["local_only"] for s in seeds):
+        frontier_pts.append((
+            "Local-Only (Flat Thr)",
+            lambda s: 100 * anchors[s]["baselines"]["local_only"]["ensemble"]["alert_rate"],
+            lambda s: 100 * anchors[s]["baselines"]["local_only"]["ensemble"]["savings"],
+            PALETTE["local_only"], "D", (1.62, 93.45), "center",
+        ))
+    frontier_pts.append((
+        "Centralized (Flat Thr)",
+        lambda s: 100 * anchors[s]["baselines"]["centralized"]["ensemble"]["alert_rate"],
+        lambda s: 100 * anchors[s]["baselines"]["centralized"]["ensemble"]["savings"],
+        PALETTE["centralized"], "*", (1.76, 95.95), "center",
+    ))
+    if _has_cond_all("baseline"):
+        frontier_pts.extend([
+            ("Baseline FL (WV)",
+             lambda s: 100 * data["baseline"][s]["ensemble"]["variants"]["weighted_voting"]["alert_rate"],
+             lambda s: 100 * data["baseline"][s]["ensemble"]["variants"]["weighted_voting"]["savings"],
+             PALETTE["baseline"], "o", (1.28, 94.38), "center"),
+            ("Baseline FL\n(Bayes@1%)",
+             lambda s: 100 * data["baseline"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["alert_rate"],
+             lambda s: 100 * data["baseline"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["savings"],
+             PALETTE["baseline_cal"], "o", (0.78, 93.72), "center"),
+        ])
+    if _has_cond_all("normalized_size_fedbn"):
+        frontier_pts.append((
+            "Proposed Size+FedBN\n(WV Flat Thr)",
+            lambda s: 100 * data["normalized_size_fedbn"][s]["ensemble"]["variants"]["weighted_voting"]["alert_rate"],
+            lambda s: 100 * data["normalized_size_fedbn"][s]["ensemble"]["variants"]["weighted_voting"]["savings"],
+            PALETTE["sky"], "^", (2.02, 94.55), "center",
+        ))
+    if _has_cond_all("normalized_fedbn"):
+        frontier_pts.append((
+            "Proposed Uniform+FedBN\n(Bayes@1%)",
+            lambda s: 100 * data["normalized_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["alert_rate"],
+            lambda s: 100 * data["normalized_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["savings"],
+            PALETTE["norm_fedbn"], "s", (1.06, 95.72), "left",
+        ))
+    if _has_cond_all("normalized_size_fedbn"):
+        frontier_pts.extend([
+            ("Proposed Size+FedBN\n(Bayes@1%)",
+             lambda s: 100 * data["normalized_size_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["alert_rate"],
+             lambda s: 100 * data["normalized_size_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"]["savings"],
+             PALETTE["norm_size_fedbn"], "^", (1.06, 96.45), "left"),
+            ("Proposed Size+FedBN\n(Bayes Uncapped)",
+             lambda s: 100 * data["normalized_size_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes"]["alert_rate"],
+             lambda s: 100 * data["normalized_size_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes"]["savings"],
+             PALETTE["norm_size_fedbn"], "P", (1.62, 97.26), "center"),
+        ])
 
     for lbl, fn_x, fn_y, col, mk, text_xy, ha in frontier_pts:
         sx = _collect(fn_x)
@@ -934,11 +968,17 @@ def generate_all_figures(suite_dir: str, out_dir: str | None = None) -> list[str
         raise SystemExit(f"No <condition>/seed_*/results.json found under {suite_dir}")
     fig_dir = out_dir or os.path.join(suite_dir, "figures")
     os.makedirs(fig_dir, exist_ok=True)
-    plot_round_convergence(data, fig_dir)
-    plot_main_comparison(data, fig_dir)
-    plot_per_silo_fairness(data, fig_dir)
-    plot_efficiency_footprint(data, fig_dir)
-    plot_ablation_and_weights(data, fig_dir)
+    for name, fn in (
+        ("fig1_round_convergence", plot_round_convergence),
+        ("fig2_main_comparison", plot_main_comparison),
+        ("fig3_per_silo_fairness", plot_per_silo_fairness),
+        ("fig4_efficiency_pareto", plot_efficiency_footprint),
+        ("fig5_ablation_2model", plot_ablation_and_weights),
+    ):
+        try:
+            fn(data, fig_dir)
+        except Exception as exc:
+            print(f"[plots] skipped {name} in {suite_dir}: {exc}")
     return sorted(
         os.path.join(fig_dir, f) for f in os.listdir(fig_dir)
         if f.endswith((".png", ".pdf"))
