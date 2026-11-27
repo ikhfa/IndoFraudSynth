@@ -16,11 +16,16 @@ Single-partition suite (`<suite_dir>/<condition>/seed_<N>/results.json`):
                                       synergy + learned model weight composition.
 
 Multi-partition suite root (`<suite_root>/<partition>/<condition>/seed_<N>/results.json`):
-  fig6_skew_degradation.{png,pdf}   — RQ1 skew degradation across IID -> Dirichlet
-                                      (alpha = 5.0, 0.5, 0.1) and realistic 15x KBMI
-                                      profile: (a) paired Delta Macro AP vs. Centralized
-                                      and (b) Pooled Test AUC-PR highlighting the
-                                      Local-Only Simpson's paradox under label skew.
+  fig6_skew_degradation.{png,pdf}           — RQ1 skew degradation across IID -> Dirichlet
+                                              (alpha = 5.0, 0.5, 0.1) and realistic 15x KBMI
+                                              profile: (a) paired Delta Macro AP vs. Centralized
+                                              and (b) Pooled Test AUC-PR exposing Simpson's paradox.
+  fig7_cross_partition_economics.{png,pdf}  — RQ2 cross-regime operational economics & detection:
+                                              (a) Bayesian IDR savings at 1% alert budget and
+                                              (b) Recall at 1% FPR across all 5 partition regimes.
+  fig8_cross_partition_efficiency.{png,pdf} — RQ3 cross-regime deployment & communication efficiency:
+                                              (a) Cumulative transfer (MB), (b) Per-round bandwidth
+                                              (MB/round), and (c) Global tree footprint across regimes.
 
 CLI:
   python -m fl_experiments.plots --suite-dir results/suite_indofraud_v2/profile
@@ -957,6 +962,401 @@ def plot_skew_degradation(suite_root: str, out_dir: str | None = None) -> list[s
     ]
 
 
+# ---------------- Figure 7: RQ2 Cross-Partition Economics & Detection ----------------
+
+def plot_cross_partition_economics(suite_root: str, out_dir: str | None = None) -> list[str]:
+    """Generate Fig. 7 (RQ2): Bayesian IDR savings @ 1% alert budget & Recall @ 1% FPR."""
+    _apply_pub_style()
+    parts = _discover_partitions(suite_root)
+    if not parts:
+        raise SystemExit(f"No partition subdirectories with results.json found under {suite_root}")
+
+    fig_dir = out_dir or os.path.join(suite_root, "figures")
+    os.makedirs(fig_dir, exist_ok=True)
+
+    method_specs = [
+        (
+            "centralized:ensemble",
+            "Centralized Ensemble",
+            lambda d, a, s, m: a[s]["baselines"]["centralized"]["ensemble"][m],
+            PALETTE["centralized"], "--", "o", 1.7,
+        ),
+        (
+            "local_only:ensemble",
+            "Local-Only Ensemble",
+            lambda d, a, s, m: a[s]["baselines"]["local_only"]["ensemble"][m],
+            PALETTE["local_only"], ":", "D", 1.7,
+        ),
+        (
+            "baseline:weighted_voting",
+            "Baseline FL (WV)",
+            lambda d, a, s, m: d["baseline"][s]["ensemble"]["variants"]["weighted_voting"][m],
+            PALETTE["baseline"], "-.", "v", 1.75,
+        ),
+        (
+            "normalized_fedbn:weighted_calibrated_bayes_1pct",
+            "Proposed Uniform+FedBN",
+            lambda d, a, s, m: d["normalized_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"][m],
+            PALETTE["norm_fedbn"], "-", "s", 2.1,
+        ),
+        (
+            "normalized_size_fedbn:weighted_calibrated_bayes_1pct",
+            "Proposed Size+FedBN",
+            lambda d, a, s, m: d["normalized_size_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"][m],
+            PALETTE["norm_size_fedbn"], "-", "^", 2.0,
+        ),
+    ]
+
+    skew_keys = {k for k, _ in _SKEW_PARTITION_ORDER}
+    part_stats: dict[str, dict[str, dict]] = {}
+    for pkey, _, pdata in parts:
+        anchors = _baseline_anchor_runs(pdata)
+        seeds = sorted(anchors.keys())
+        valid_seeds = [
+            s for s in seeds
+            if all(c in pdata and s in pdata[c] for c in ("baseline", "normalized_fedbn", "normalized_size_fedbn"))
+        ]
+        part_stats[pkey] = {}
+        for mkey, _, fn, *_ in method_specs:
+            bsav = [100.0 * fn(pdata, anchors, s, "bayes_savings_at_1pct") for s in valid_seeds]
+            rec = [100.0 * fn(pdata, anchors, s, "recall_at_fpr_001") for s in valid_seeds]
+            part_stats[pkey][mkey] = {
+                "bayes_1pct": mean_ci95(bsav),
+                "rec_1pct": mean_ci95(rec),
+            }
+
+    skew_parts = [(k, lbl) for k, lbl, _ in parts if k in skew_keys]
+    has_profile = any(k == _PROFILE_PARTITION[0] for k, _, _ in parts)
+    x_skew = np.arange(len(skew_parts), dtype=float)
+    sep_x = len(skew_parts) - 0.42
+    prof_x = len(skew_parts) + 0.30
+    tick_pos = list(x_skew) + ([prof_x] if has_profile else [])
+    tick_lbls = [lbl for _, lbl in skew_parts] + ([_PROFILE_PARTITION[1]] if has_profile else [])
+
+    dodges_skew = [-0.08, -0.04, 0.0, 0.04, 0.08]
+    dodges_prof = [-0.20, -0.10, 0.0, 0.10, 0.20]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.6, 4.65))
+
+    if has_profile:
+        for ax in (ax1, ax2):
+            ax.axvline(sep_x, color="#666666", ls="--", lw=1.1, alpha=0.75, zorder=1)
+            ax.axvspan(sep_x, prof_x + 0.62, color="#EEF2F7", alpha=0.65, zorder=0)
+            ax.text(
+                prof_x, 0.985, "Realistic\nInstitutional", transform=ax.get_xaxis_transform(),
+                ha="center", va="top", fontsize=7.5, color="#4A5568", style="italic",
+            )
+
+    # ---- Panel (a): Bayesian IDR Fraud-Loss Savings at 1% Alert Budget ----
+    for idx, (mkey, lbl, _, col, ls, mk, lw) in enumerate(method_specs):
+        dx = dodges_skew[idx]
+        ys = np.array([part_stats[k][mkey]["bayes_1pct"]["mean"] for k, _ in skew_parts])
+        cis = np.array([part_stats[k][mkey]["bayes_1pct"]["ci95"] for k, _ in skew_parts])
+        yerr_lo = np.minimum(cis, ys)
+        yerr_hi = np.minimum(cis, 100.0 - ys)
+        ax1.errorbar(
+            x_skew + dx, ys, yerr=[yerr_lo, yerr_hi], label=lbl, color=col,
+            linestyle=ls, marker=mk, markersize=5.8, linewidth=lw,
+            capsize=3.0, elinewidth=1.05, markeredgecolor="#222222", markeredgewidth=0.5,
+            zorder=4 if "Proposed" in lbl else 3,
+        )
+        if has_profile:
+            pk = _PROFILE_PARTITION[0]
+            py = part_stats[pk][mkey]["bayes_1pct"]["mean"]
+            pci = part_stats[pk][mkey]["bayes_1pct"]["ci95"]
+            ax1.errorbar(
+                prof_x + dodges_prof[idx], py,
+                yerr=[[min(pci, py)], [min(pci, 100.0 - py)]],
+                color=col, linestyle="none", marker=mk, markersize=6.2,
+                capsize=3.2, elinewidth=1.15, markeredgecolor="#222222", markeredgewidth=0.55,
+                zorder=4 if "Proposed" in lbl else 3,
+            )
+
+    # Callout 1: Baseline uncalibrated Bayes@1% collapse at Dir(0.5) & Dir(0.1)
+    if "dirichlet_a0p5" in part_stats and "dirichlet_a0p1" in part_stats:
+        b_05 = part_stats["dirichlet_a0p5"]["baseline:weighted_voting"]["bayes_1pct"]["mean"]
+        b_01 = part_stats["dirichlet_a0p1"]["baseline:weighted_voting"]["bayes_1pct"]["mean"]
+        u_05 = part_stats["dirichlet_a0p5"]["normalized_fedbn:weighted_calibrated_bayes_1pct"]["bayes_1pct"]["mean"]
+        u_01 = part_stats["dirichlet_a0p1"]["normalized_fedbn:weighted_calibrated_bayes_1pct"]["bayes_1pct"]["mean"]
+        ax1.annotate(
+            f"Uncalibrated Baseline collapses\n({b_05:.1f}% at α=0.5, {b_01:.1f}% at α=0.1)",
+            xy=(2.0 + dodges_skew[2] - 0.04, b_05 - 1.0),
+            xytext=(0.76, 39.0),
+            ha="center", va="center", fontsize=7.5, color=PALETTE["baseline"], fontweight="bold",
+            arrowprops=dict(arrowstyle="->", color=PALETTE["baseline"], lw=1.2, connectionstyle="arc3,rad=0.12"),
+            bbox=dict(boxstyle="round,pad=0.25", fc="white", ec=PALETTE["baseline"], alpha=0.95),
+            zorder=6,
+        )
+        ax1.annotate(
+            f"Calibration rescues Bayes@1%:\n+{u_05 - b_05:.1f} pp (α=0.5), +{u_01 - b_01:.1f} pp (α=0.1)",
+            xy=(3.0 + dodges_skew[3] - 0.04, u_01 - 1.0),
+            xytext=(0.78, 79.0),
+            ha="center", va="center", fontsize=7.4, color=PALETTE["norm_fedbn"], fontweight="bold",
+            arrowprops=dict(arrowstyle="->", color=PALETTE["norm_fedbn"], lw=1.2, connectionstyle="arc3,rad=-0.12"),
+            bbox=dict(boxstyle="round,pad=0.25", fc="white", ec=PALETTE["norm_fedbn"], alpha=0.95),
+            zorder=6,
+        )
+
+    if has_profile:
+        u_p = part_stats["profile"]["normalized_fedbn:weighted_calibrated_bayes_1pct"]["bayes_1pct"]["mean"]
+        b_p = part_stats["profile"]["baseline:weighted_voting"]["bayes_1pct"]["mean"]
+        ax1.annotate(
+            f"Profile (15× KBMI):\nProposed {u_p:.1f}%\nvs. Baseline {b_p:.1f}%",
+            xy=(prof_x + dodges_prof[3], u_p - 1.5),
+            xytext=(prof_x - 0.02, 70.0),
+            ha="center", va="center", fontsize=7.4, color=PALETTE["norm_fedbn"], fontweight="bold",
+            arrowprops=dict(arrowstyle="->", color=PALETTE["norm_fedbn"], lw=1.15, connectionstyle="arc3,rad=0.16"),
+            bbox=dict(boxstyle="round,pad=0.24", fc="white", ec=PALETTE["norm_fedbn"], alpha=0.95),
+            zorder=6,
+        )
+
+    ax1.set_xticks(tick_pos)
+    ax1.set_xticklabels(tick_lbls)
+    ax1.set_xlim(-0.44, (prof_x + 0.62) if has_profile else (len(skew_parts) - 0.5))
+    ax1.set_ylim(20.0, 110.5)
+    ax1.set_ylabel("IDR Fraud-Loss Savings at 1% Alert Budget (%)")
+    ax1.set_title("(a) Bayesian Cost-Sensitive IDR Savings (Bayes@1%)")
+
+    # ---- Panel (b): Recall at 1% False-Positive Rate ----
+    for idx, (mkey, lbl, _, col, ls, mk, lw) in enumerate(method_specs):
+        dx = dodges_skew[idx]
+        ys = np.array([part_stats[k][mkey]["rec_1pct"]["mean"] for k, _ in skew_parts])
+        cis = np.array([part_stats[k][mkey]["rec_1pct"]["ci95"] for k, _ in skew_parts])
+        yerr_lo = np.minimum(cis, ys)
+        yerr_hi = np.minimum(cis, 100.0 - ys)
+        ax2.errorbar(
+            x_skew + dx, ys, yerr=[yerr_lo, yerr_hi], color=col,
+            linestyle=ls, marker=mk, markersize=5.8, linewidth=lw,
+            capsize=3.0, elinewidth=1.05, markeredgecolor="#222222", markeredgewidth=0.5,
+            zorder=4 if "Proposed" in lbl else 3,
+        )
+        if has_profile:
+            pk = _PROFILE_PARTITION[0]
+            py = part_stats[pk][mkey]["rec_1pct"]["mean"]
+            pci = part_stats[pk][mkey]["rec_1pct"]["ci95"]
+            ax2.errorbar(
+                prof_x + dodges_prof[idx], py,
+                yerr=[[min(pci, py)], [min(pci, 100.0 - py)]],
+                color=col, linestyle="none", marker=mk, markersize=6.2,
+                capsize=3.2, elinewidth=1.15, markeredgecolor="#222222", markeredgewidth=0.55,
+                zorder=4 if "Proposed" in lbl else 3,
+            )
+
+    if "dirichlet_a0p1" in part_stats:
+        lo_r01 = part_stats["dirichlet_a0p1"]["local_only:ensemble"]["rec_1pct"]["mean"]
+        ax2.annotate(
+            f"Local-Only ({lo_r01:.1f}%):\npooled base-rate artifact",
+            xy=(3.0 + dodges_skew[1] - 0.04, lo_r01),
+            xytext=(1.05, 102.5),
+            ha="center", va="center", fontsize=7.4, color="#333333", fontweight="bold",
+            arrowprops=dict(arrowstyle="->", color=PALETTE["local_only"], lw=1.15, connectionstyle="arc3,rad=-0.06"),
+            bbox=dict(boxstyle="round,pad=0.22", fc="white", ec=PALETTE["local_only"], alpha=0.95),
+            zorder=6,
+        )
+
+    if "dirichlet_a0p5" in part_stats:
+        u_r05 = part_stats["dirichlet_a0p5"]["normalized_fedbn:weighted_calibrated_bayes_1pct"]["rec_1pct"]["mean"]
+        b_r05 = part_stats["dirichlet_a0p5"]["baseline:weighted_voting"]["rec_1pct"]["mean"]
+        ax2.annotate(
+            f"Proposed matches/beats\nCentralized at α∈{{5.0, 0.5}}\n({u_r05:.1f}% vs. {b_r05:.1f}% Baseline)",
+            xy=(2.0 + dodges_skew[3], u_r05 - 1.5),
+            xytext=(1.05, 60.0),
+            ha="center", va="center", fontsize=7.5, color=PALETTE["norm_fedbn"], fontweight="bold",
+            arrowprops=dict(arrowstyle="->", color=PALETTE["norm_fedbn"], lw=1.2, connectionstyle="arc3,rad=0.14"),
+            bbox=dict(boxstyle="round,pad=0.24", fc="white", ec=PALETTE["norm_fedbn"], alpha=0.95),
+            zorder=6,
+        )
+
+    if has_profile:
+        u_rp = part_stats["profile"]["normalized_fedbn:weighted_calibrated_bayes_1pct"]["rec_1pct"]["mean"]
+        b_rp = part_stats["profile"]["baseline:weighted_voting"]["rec_1pct"]["mean"]
+        ax2.annotate(
+            f"Proposed: {u_rp:.1f}%\nvs. Baseline: {b_rp:.1f}%\n(+{u_rp - b_rp:.1f} pp)",
+            xy=(prof_x + dodges_prof[3], u_rp - 1.5),
+            xytext=(prof_x - 0.02, 57.0),
+            ha="center", va="center", fontsize=7.4, color=PALETTE["norm_fedbn"], fontweight="bold",
+            arrowprops=dict(arrowstyle="->", color=PALETTE["norm_fedbn"], lw=1.15, connectionstyle="arc3,rad=0.16"),
+            bbox=dict(boxstyle="round,pad=0.24", fc="white", ec=PALETTE["norm_fedbn"], alpha=0.95),
+            zorder=6,
+        )
+
+    ax2.set_xticks(tick_pos)
+    ax2.set_xticklabels(tick_lbls)
+    ax2.set_xlim(-0.44, (prof_x + 0.62) if has_profile else (len(skew_parts) - 0.5))
+    ax2.set_ylim(18.0, 110.5)
+    ax2.set_ylabel("Fraud Recall at 1% False-Positive Rate (%)")
+    ax2.set_title("(b) Operational Fraud Detection Rate (Recall @ 1% FPR)")
+
+    handles, labels = ax1.get_legend_handles_labels()
+    fig.legend(
+        handles, labels, loc="upper center", ncol=len(method_specs),
+        bbox_to_anchor=(0.5, 1.03), frameon=True, fontsize=8.1,
+    )
+    fig.suptitle(
+        "RQ2: Operational IDR Savings & Fraud Detection Across Five Partition Regimes (5 Seeds, Mean ± 95% CI)",
+        y=1.10, fontsize=11.0, fontweight="bold",
+    )
+    fig.tight_layout()
+    _save(fig, fig_dir, "fig7_cross_partition_economics")
+    return [
+        os.path.join(fig_dir, "fig7_cross_partition_economics.png"),
+        os.path.join(fig_dir, "fig7_cross_partition_economics.pdf"),
+    ]
+
+
+# ---------------- Figure 8: RQ3 Cross-Partition Efficiency & Footprint ----------------
+
+def plot_cross_partition_efficiency(suite_root: str, out_dir: str | None = None) -> list[str]:
+    """Generate Fig. 8 (RQ3): Communication volume, per-round bandwidth & tree footprint."""
+    _apply_pub_style()
+    parts = _discover_partitions(suite_root)
+    if not parts:
+        raise SystemExit(f"No partition subdirectories with results.json found under {suite_root}")
+
+    fig_dir = out_dir or os.path.join(suite_root, "figures")
+    os.makedirs(fig_dir, exist_ok=True)
+
+    cond_specs = [
+        ("baseline", "Baseline FL (Unnorm.)", PALETTE["baseline"]),
+        ("normalized_fedbn", "Proposed Uniform+FedBN", PALETTE["norm_fedbn"]),
+        ("normalized_size_fedbn", "Proposed Size+FedBN", PALETTE["norm_size_fedbn"]),
+    ]
+
+    # Preserve canonical visual order: IID -> Dir(5.0) -> Dir(0.5) -> Dir(0.1) | Profile
+    ordered_parts = [(k, lbl, d) for k, lbl, d in parts]
+    n_parts = len(ordered_parts)
+    has_profile = any(k == _PROFILE_PARTITION[0] for k, _, _ in ordered_parts)
+    n_skew = n_parts - (1 if has_profile else 0)
+
+    x_pos = np.array(
+        list(range(n_skew)) + ([n_skew + 0.35] if has_profile else []),
+        dtype=float,
+    )
+    sep_x = n_skew - 0.32
+    x_lbls = [lbl for _, lbl, _ in ordered_parts]
+
+    # Collect stats per (part, cond)
+    eff_stats: dict[str, dict[str, dict]] = {}
+    for pkey, _, pdata in ordered_parts:
+        eff_stats[pkey] = {}
+        for ckey, _, _ in cond_specs:
+            if ckey not in pdata:
+                continue
+            tots, per_rds, trees = [], [], []
+            for res in pdata[ckey].values():
+                fl = res["fl"]
+                tot_mb = sum(fl[m]["upload_bytes"] + fl[m]["broadcast_bytes"] for m in fl) / (1024 * 1024)
+                n_r = max(len(fl[m]["rounds"]) for m in fl)
+                sz = res.get("global_model_sizes", {})
+                n_tr = sz.get("xgboost", {}).get("n_trees", 0) + sz.get("catboost", {}).get("n_trees", 0)
+                tots.append(tot_mb)
+                per_rds.append(tot_mb / max(n_r, 1))
+                trees.append(n_tr)
+            eff_stats[pkey][ckey] = {
+                "comm_mb": mean_ci95(tots),
+                "mb_per_rd": mean_ci95(per_rds),
+                "trees": mean_ci95(trees),
+            }
+
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(13.6, 4.35))
+    bw = 0.24
+    offsets = [-bw, 0.0, bw]
+
+    panels = [
+        (ax1, "comm_mb", "Cumulative Transfer (MB)", "(a) Total Communication Volume", 1.0, False),
+        (ax2, "mb_per_rd", "Bandwidth per Round (MB / Round)", "(b) Per-Round Communication", 1.0, False),
+        (ax3, "trees", "Total Global Trees (Thousands)", "(c) Global Ensemble Tree Budget", 1e-3, True),
+    ]
+
+    for ax, metric_key, ylabel, title, scale, show_pct_all in panels:
+        if has_profile:
+            ax.axvline(sep_x, color="#666666", ls="--", lw=1.0, alpha=0.7, zorder=1)
+            ax.axvspan(sep_x, x_pos[-1] + 0.52, color="#EEF2F7", alpha=0.65, zorder=0)
+            ax.text(
+                x_pos[-1], 0.98, "Realistic\nInstitutional", transform=ax.get_xaxis_transform(),
+                ha="center", va="top", fontsize=7.3, color="#4A5568", style="italic",
+            )
+
+        max_top = 0.0
+        for c_idx, (ckey, clbl, col) in enumerate(cond_specs):
+            ms, cs = [], []
+            for pkey, _, _ in ordered_parts:
+                st = eff_stats[pkey].get(ckey, {}).get(metric_key, {"mean": np.nan, "ci95": 0.0})
+                ms.append(st["mean"] * scale)
+                cs.append(st["ci95"] * scale)
+            ms_arr = np.array(ms)
+            cs_arr = np.array(cs)
+            # Clip lower bar at 0
+            err_lo = np.minimum(cs_arr, np.maximum(ms_arr, 0.0))
+            bars = ax.bar(
+                x_pos + offsets[c_idx], ms_arr, width=bw * 0.92,
+                yerr=[err_lo, cs_arr], capsize=2.3,
+                color=col, alpha=0.90, edgecolor="#222222", linewidth=0.55,
+                error_kw={"lw": 0.9}, label=clbl if ax is ax1 else None, zorder=3,
+            )
+            for m_v, c_v in zip(ms_arr, cs_arr):
+                if np.isfinite(m_v):
+                    max_top = max(max_top, m_v + c_v)
+
+        # Annotate percentage reduction of Proposed Uniform+FedBN vs Baseline
+        for p_idx, (pkey, _, _) in enumerate(ordered_parts):
+            b_m = eff_stats[pkey].get("baseline", {}).get(metric_key, {}).get("mean", np.nan)
+            u_m = eff_stats[pkey].get("normalized_fedbn", {}).get(metric_key, {}).get("mean", np.nan)
+            u_c = eff_stats[pkey].get("normalized_fedbn", {}).get(metric_key, {}).get("ci95", 0.0)
+            if np.isfinite(b_m) and b_m > 0 and np.isfinite(u_m):
+                red = 100.0 * (1.0 - u_m / b_m)
+                if show_pct_all or red >= 10.0:
+                    y_txt = (u_m + u_c) * scale + max_top * 0.025
+                    ax.text(
+                        x_pos[p_idx] + offsets[1], y_txt, f"−{red:.0f}%",
+                        ha="center", va="bottom", fontsize=6.9, fontweight="bold",
+                        color=PALETTE["norm_fedbn"],
+                        bbox=dict(boxstyle="round,pad=0.10", fc="white", ec="none", alpha=0.88),
+                        zorder=6,
+                    )
+
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(x_lbls, fontsize=7.8)
+        ax.set_xlim(-0.52, x_pos[-1] + 0.52)
+        ax.set_ylim(0, max_top * 1.24)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+
+    handles, labels = ax1.get_legend_handles_labels()
+    fig.legend(
+        handles, labels, loc="upper center", ncol=len(cond_specs),
+        bbox_to_anchor=(0.5, 1.035), frameon=True, fontsize=8.3,
+    )
+    fig.suptitle(
+        "RQ3: Communication & Model-Size Efficiency Across Five Partition Regimes (5 Seeds, Mean ± 95% CI)",
+        y=1.105, fontsize=11.0, fontweight="bold",
+    )
+    fig.tight_layout()
+    _save(fig, fig_dir, "fig8_cross_partition_efficiency")
+    return [
+        os.path.join(fig_dir, "fig8_cross_partition_efficiency.png"),
+        os.path.join(fig_dir, "fig8_cross_partition_efficiency.pdf"),
+    ]
+
+
+def generate_cross_partition_figures(suite_root: str, out_dir: str | None = None) -> list[str]:
+    """Generate all cross-partition suite figures (fig6, fig7, fig8)."""
+    _apply_pub_style()
+    fig_dir = out_dir or os.path.join(suite_root, "figures")
+    os.makedirs(fig_dir, exist_ok=True)
+    generated: list[str] = []
+    for name, fn in (
+        ("fig6_skew_degradation", plot_skew_degradation),
+        ("fig7_cross_partition_economics", plot_cross_partition_economics),
+        ("fig8_cross_partition_efficiency", plot_cross_partition_efficiency),
+    ):
+        try:
+            generated.extend(fn(suite_root, fig_dir))
+        except Exception as exc:
+            print(f"[plots] skipped {name} in {suite_root}: {exc}")
+    return sorted(generated)
+
+
 def generate_all_figures(suite_dir: str, out_dir: str | None = None) -> list[str]:
     _apply_pub_style()
     data = load_suite_by_condition(suite_dir)
@@ -964,7 +1364,7 @@ def generate_all_figures(suite_dir: str, out_dir: str | None = None) -> list[str
         # Auto-fallback to multi-partition suite root if partition subdirs exist
         parts = _discover_partitions(suite_dir)
         if parts:
-            return plot_skew_degradation(suite_dir, out_dir)
+            return generate_cross_partition_figures(suite_dir, out_dir)
         raise SystemExit(f"No <condition>/seed_*/results.json found under {suite_dir}")
     fig_dir = out_dir or os.path.join(suite_dir, "figures")
     os.makedirs(fig_dir, exist_ok=True)

@@ -21,7 +21,7 @@ import os
 import subprocess
 import sys
 
-from .plots import generate_all_figures, plot_skew_degradation
+from .plots import generate_all_figures, generate_cross_partition_figures
 from .stats import load_suite_dir, analyze_runs
 
 
@@ -212,10 +212,10 @@ def main():
                 print(f"[stats] Wrote pooled ({len(part_tags_present)} partitions, macro_ap) -> {macro_dir}")
             if not args.no_figures:
                 try:
-                    figs6 = plot_skew_degradation(args.out)
-                    print(f"[plots] Generated {len(figs6)} cross-partition figure files -> {os.path.join(args.out, 'figures')}")
+                    figs_x = generate_cross_partition_figures(args.out)
+                    print(f"[plots] Generated {len(figs_x)} cross-partition figure files -> {os.path.join(args.out, 'figures')}")
                 except Exception as exc:
-                    print(f"[plots] Skipped cross-partition fig6 for {args.out}: {exc}")
+                    print(f"[plots] Skipped cross-partition figures for {args.out}: {exc}")
 
 
 if __name__ == "__main__":
