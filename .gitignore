@@ -25,6 +25,9 @@ _model_cache/
 uploads/
 paper.txt
 
+# Publications
+publications/
+
 # OS / editor artifacts
 .DS_Store
 Thumbs.db

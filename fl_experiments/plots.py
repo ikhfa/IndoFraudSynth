@@ -1,8 +1,8 @@
 """Publication-grade figure generator for multi-seed FL fraud-detection suites.
 
-Generates 5 camera-ready figures (both 300-DPI PNG and vector PDF) from a
-completed `<suite_dir>` containing `<condition>/seed_<N>/results.json`:
+Generates camera-ready figures (both 300-DPI PNG and vector PDF):
 
+Single-partition suite (`<suite_dir>/<condition>/seed_<N>/results.json`):
   fig1_round_convergence.{png,pdf}  — Round-by-round macro val AUC-PR (XGBoost,
                                       CatBoost, MLP) highlighting baseline Round-2
                                       Hessian collapse vs. normalized stability.
@@ -15,8 +15,16 @@ completed `<suite_dir>` containing `<condition>/seed_<N>/results.json`:
   fig5_ablation_2model.{png,pdf}    — Individual vs. 2-model & 3-model ensemble
                                       synergy + learned model weight composition.
 
+Multi-partition suite root (`<suite_root>/<partition>/<condition>/seed_<N>/results.json`):
+  fig6_skew_degradation.{png,pdf}   — RQ1 skew degradation across IID -> Dirichlet
+                                      (alpha = 5.0, 0.5, 0.1) and realistic 15x KBMI
+                                      profile: (a) paired Delta Macro AP vs. Centralized
+                                      and (b) Pooled Test AUC-PR highlighting the
+                                      Local-Only Simpson's paradox under label skew.
+
 CLI:
   python -m fl_experiments.plots --suite-dir results/suite_indofraud_v2/profile
+  python -m fl_experiments.plots --suite-dir results/suite_indofraud_v2
 """
 from __future__ import annotations
 
@@ -31,7 +39,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from .stats import mean_ci95
+from .stats import friedman_test, holm_wilcoxon, mean_ci95
 
 # Colorblind-safe Okabe-Ito inspired palette
 PALETTE = {
@@ -587,10 +595,342 @@ def plot_ablation_and_weights(data: dict[str, dict[int, dict]], out_dir: str):
     _save(fig, out_dir, "fig5_ablation_2model")
 
 
+# ---------------- Figure 6: RQ1 Multi-Partition Skew Degradation ----------------
+
+_SKEW_PARTITION_ORDER = [
+    ("equal", "IID\n(Equal)"),
+    ("dirichlet_a5p0", "Dirichlet\n(α = 5.0)"),
+    ("dirichlet_a0p5", "Dirichlet\n(α = 0.5)"),
+    ("dirichlet_a0p1", "Dirichlet\n(α = 0.1)"),
+]
+_PROFILE_PARTITION = ("profile", "Profile\n(15× KBMI)")
+
+
+def _discover_partitions(suite_root: str) -> list[tuple[str, str, dict[str, dict[int, dict]]]]:
+    """Return ordered list of `(part_key, display_label, condition_seed_data)`."""
+    found = []
+    for key, label in _SKEW_PARTITION_ORDER + [_PROFILE_PARTITION]:
+        pdir = os.path.join(suite_root, key)
+        if os.path.isdir(pdir):
+            pdata = load_suite_by_condition(pdir)
+            if pdata:
+                found.append((key, label, pdata))
+    return found
+
+
+def plot_skew_degradation(suite_root: str, out_dir: str | None = None) -> list[str]:
+    """Generate Fig. 6 (RQ1): Cross-partition skew degradation & Simpson's paradox."""
+    _apply_pub_style()
+    parts = _discover_partitions(suite_root)
+    if not parts:
+        raise SystemExit(f"No partition subdirectories with results.json found under {suite_root}")
+
+    fig_dir = out_dir or os.path.join(suite_root, "figures")
+    os.makedirs(fig_dir, exist_ok=True)
+
+    # Canonical primary methods matching stats.py `select_primary_methods`
+    method_specs = [
+        (
+            "centralized:ensemble",
+            "Centralized Ensemble",
+            lambda d, a, s, m: a[s]["baselines"]["centralized"]["ensemble"][m],
+            PALETTE["centralized"], "--", "o", 1.7,
+        ),
+        (
+            "local_only:ensemble",
+            "Local-Only Ensemble",
+            lambda d, a, s, m: a[s]["baselines"]["local_only"]["ensemble"][m],
+            PALETTE["local_only"], ":", "D", 1.7,
+        ),
+        (
+            "baseline:weighted_voting",
+            "Baseline FL (WV)",
+            lambda d, a, s, m: d["baseline"][s]["ensemble"]["variants"]["weighted_voting"][m],
+            PALETTE["baseline"], "-.", "v", 1.75,
+        ),
+        (
+            "normalized_fedbn:weighted_calibrated_bayes_1pct",
+            "Proposed Uniform+FedBN",
+            lambda d, a, s, m: d["normalized_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"][m],
+            PALETTE["norm_fedbn"], "-", "s", 2.1,
+        ),
+        (
+            "normalized_size_fedbn:weighted_calibrated_bayes_1pct",
+            "Proposed Size+FedBN",
+            lambda d, a, s, m: d["normalized_size_fedbn"][s]["ensemble"]["variants"]["weighted_calibrated_bayes_1pct"][m],
+            PALETTE["norm_size_fedbn"], "-", "^", 2.0,
+        ),
+    ]
+
+    # Collect per-partition summary stats + full N-block matrix for Friedman/Holm badge
+    skew_keys = {k for k, _ in _SKEW_PARTITION_ORDER}
+    part_stats: dict[str, dict[str, dict]] = {}
+    block_rows_macro: list[list[float]] = []
+
+    for pkey, _, pdata in parts:
+        anchors = _baseline_anchor_runs(pdata)
+        seeds = sorted(anchors.keys())
+        # Ensure all conditions are present for each seed
+        valid_seeds = [
+            s for s in seeds
+            if all(c in pdata and s in pdata[c] for c in ("baseline", "normalized_fedbn", "normalized_size_fedbn"))
+        ]
+        part_stats[pkey] = {}
+        cent_macro_by_seed = {
+            s: anchors[s]["baselines"]["centralized"]["ensemble"]["macro_ap"]
+            for s in valid_seeds
+        }
+        for mkey, _, fn, *_ in method_specs:
+            pooled_vals = [fn(pdata, anchors, s, "pooled_ap") for s in valid_seeds]
+            macro_vals = [fn(pdata, anchors, s, "macro_ap") for s in valid_seeds]
+            delta_vals = [mv - cent_macro_by_seed[s] for mv, s in zip(macro_vals, valid_seeds)]
+            part_stats[pkey][mkey] = {
+                "pooled": mean_ci95(pooled_vals),
+                "macro": mean_ci95(macro_vals),
+                "delta_macro": mean_ci95(delta_vals),
+            }
+        for s in valid_seeds:
+            block_rows_macro.append([
+                fn(pdata, anchors, s, "macro_ap") for _, _, fn, *_ in method_specs
+            ])
+
+    # Compute N-block Friedman & Holm-Wilcoxon dynamically for the statistical badge
+    mnames = [ms[0] for ms in method_specs]
+    mat_macro = np.asarray(block_rows_macro, dtype=np.float64)
+    fr_macro = friedman_test(mat_macro, mnames, higher_is_better=True)
+    hw_macro = holm_wilcoxon(mat_macro, mnames, higher_is_better=True)
+    p_unif_vs_base = float("nan")
+    for pair in hw_macro:
+        pair_set = {pair["method_a"], pair["method_b"]}
+        if pair_set == {"baseline:weighted_voting", "normalized_fedbn:weighted_calibrated_bayes_1pct"}:
+            p_unif_vs_base = pair["p_holm"]
+            break
+
+    # X-axis coordinates: continuous Dirichlet progression [0..k-1] + separated Profile column
+    skew_parts = [(k, lbl) for k, lbl, _ in parts if k in skew_keys]
+    has_profile = any(k == _PROFILE_PARTITION[0] for k, _, _ in parts)
+
+    x_skew = np.arange(len(skew_parts), dtype=float)
+    sep_x = len(skew_parts) - 0.42
+    prof_x = len(skew_parts) + 0.30
+
+    tick_pos = list(x_skew) + ([prof_x] if has_profile else [])
+    tick_lbls = [lbl for _, lbl in skew_parts] + ([_PROFILE_PARTITION[1]] if has_profile else [])
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.6, 4.65))
+
+    # Subtle shaded region for realistic Profile regime on both panels
+    if has_profile:
+        for ax in (ax1, ax2):
+            ax.axvline(sep_x, color="#666666", ls="--", lw=1.1, alpha=0.75, zorder=1)
+            ax.axvspan(sep_x, prof_x + 0.62, color="#EEF2F7", alpha=0.65, zorder=0)
+            ax.text(
+                prof_x, 0.975, "Realistic\nInstitutional", transform=ax.get_xaxis_transform(),
+                ha="center", va="top", fontsize=7.6, color="#4A5568", style="italic",
+            )
+
+    # ---- Panel (a): Paired Delta Macro Test AUC-PR vs. Centralized ----
+    ax1.axhline(0.0, color=PALETTE["centralized"], ls="--", lw=1.5, zorder=2)
+
+    non_cent_specs = [ms for ms in method_specs if ms[0] != "centralized:ensemble"]
+    dodges_skew_a = [-0.075, -0.025, 0.025, 0.075]
+    dodges_prof_a = [-0.18, -0.06, 0.06, 0.18]
+
+    for idx, (mkey, lbl, _, col, ls, mk, lw) in enumerate(non_cent_specs):
+        dx = dodges_skew_a[idx]
+        ys = np.array([part_stats[k][mkey]["delta_macro"]["mean"] for k, _ in skew_parts])
+        cis = np.array([part_stats[k][mkey]["delta_macro"]["ci95"] for k, _ in skew_parts])
+        ax1.errorbar(
+            x_skew + dx, ys, yerr=cis, color=col, linestyle=ls, marker=mk,
+            markersize=5.8, linewidth=lw, capsize=3.0, elinewidth=1.05,
+            markeredgecolor="#222222", markeredgewidth=0.5, zorder=4 if "Proposed" in lbl else 3,
+        )
+        if has_profile:
+            pk = _PROFILE_PARTITION[0]
+            py = part_stats[pk][mkey]["delta_macro"]["mean"]
+            pci = part_stats[pk][mkey]["delta_macro"]["ci95"]
+            ax1.errorbar(
+                prof_x + dodges_prof_a[idx], py, yerr=pci, color=col, linestyle="none",
+                marker=mk, markersize=6.2, capsize=3.2, elinewidth=1.15,
+                markeredgecolor="#222222", markeredgewidth=0.55, zorder=4 if "Proposed" in lbl else 3,
+            )
+
+    # Annotate Centralized raw Macro AP anchors softly right above y=0
+    anchor_xs = list(x_skew) + ([prof_x] if has_profile else [])
+    anchor_keys = [k for k, _ in skew_parts] + ([_PROFILE_PARTITION[0]] if has_profile else [])
+    for xi, pk in zip(anchor_xs, anchor_keys):
+        cm = part_stats[pk]["centralized:ensemble"]["macro"]["mean"]
+        tag = f"Cent: {cm:.3f}" if xi == 0 else f"{cm:.3f}"
+        ax1.text(
+            xi, 0.014, tag, ha="center", va="bottom",
+            fontsize=7.3, color="#333333", fontweight="bold" if xi == 0 else "normal",
+            bbox=dict(boxstyle="round,pad=0.14", fc="white", ec="none", alpha=0.94),
+            zorder=7,
+        )
+
+    # Callout 1: Local-Only within-silo collapse at Dir(0.1)
+    if "dirichlet_a0p1" in part_stats:
+        lo_d01 = part_stats["dirichlet_a0p1"]["local_only:ensemble"]["delta_macro"]["mean"]
+        ax1.annotate(
+            f"Local-Only within-silo\ncollapse ({lo_d01:+.3f} Macro AP)",
+            xy=(3.0 + dodges_skew_a[0] - 0.03, lo_d01),
+            xytext=(1.55, -0.31),
+            ha="center", va="center", fontsize=7.7, color="#333333", fontweight="bold",
+            arrowprops=dict(arrowstyle="->", color=PALETTE["local_only"], lw=1.2, connectionstyle="arc3,rad=0.12"),
+            bbox=dict(boxstyle="round,pad=0.25", fc="white", ec=PALETTE["local_only"], alpha=0.94),
+            zorder=6,
+        )
+
+    # Callout 2: Profile improvement (+0.044 over Baseline)
+    if has_profile:
+        unif_p = part_stats["profile"]["normalized_fedbn:weighted_calibrated_bayes_1pct"]["delta_macro"]["mean"]
+        base_p = part_stats["profile"]["baseline:weighted_voting"]["delta_macro"]["mean"]
+        gain_p = unif_p - base_p
+        ax1.annotate(
+            f"Proposed vs. Baseline:\n{unif_p:+.3f} vs. {base_p:+.3f}\n(+{gain_p:.3f} Macro AP)",
+            xy=(prof_x + dodges_prof_a[2], unif_p - 0.025),
+            xytext=(prof_x - 0.04, -0.23),
+            ha="center", va="center", fontsize=7.4, color=PALETTE["norm_fedbn"], fontweight="bold",
+            arrowprops=dict(arrowstyle="->", color=PALETTE["norm_fedbn"], lw=1.15, connectionstyle="arc3,rad=0.18"),
+            bbox=dict(boxstyle="round,pad=0.24", fc="white", ec=PALETTE["norm_fedbn"], alpha=0.95),
+            zorder=6,
+        )
+
+    # Dynamic Friedman + Holm-Wilcoxon badge (bottom-left) with publication math formatting
+    def _fmt_p_tex(p: float) -> str:
+        if not np.isfinite(p):
+            return r"\mathrm{n/a}"
+        if p >= 0.001:
+            return f"{p:.3f}"
+        mant, exp = f"{p:.1e}".split("e")
+        return rf"{mant}\times 10^{{{int(exp)}}}"
+
+    n_blocks = mat_macro.shape[0]
+    stat_txt = (
+        f"{n_blocks}-Block Friedman (Macro AP): "
+        rf"$\chi^2 = {fr_macro['chi2']:.2f},\; p = {_fmt_p_tex(fr_macro['p_value'])}$"
+        "\n"
+        rf"Uniform+FedBN vs. Baseline: $p_{{\mathrm{{Holm}}}} = {_fmt_p_tex(p_unif_vs_base)}$"
+    )
+    ax1.text(
+        0.02, 0.03, stat_txt, transform=ax1.transAxes, ha="left", va="bottom",
+        fontsize=7.3, color="#222222",
+        bbox=dict(boxstyle="round,pad=0.28", fc="#FAFAFA", ec="#BBBBBB", alpha=0.95),
+        zorder=6,
+    )
+
+    ax1.set_xticks(tick_pos)
+    ax1.set_xticklabels(tick_lbls)
+    ax1.set_xlim(-0.44, (prof_x + 0.62) if has_profile else (len(skew_parts) - 0.5))
+    ax1.set_ylim(-0.44, 0.12)
+    ax1.set_ylabel("Δ Per-Silo Macro Test AUC-PR\n(Method − Centralized Upper Bound)")
+    ax1.set_title("(a) Unconfounded Within-Silo Degradation vs. Centralized")
+
+    # ---- Panel (b): Pooled Test AUC-PR Across Regimes (Exposing Simpson's Paradox) ----
+    dodges_skew_b = [-0.08, -0.04, 0.0, 0.04, 0.08]
+    dodges_prof_b = [-0.20, -0.10, 0.0, 0.10, 0.20]
+
+    for idx, (mkey, lbl, _, col, ls, mk, lw) in enumerate(method_specs):
+        dx = dodges_skew_b[idx]
+        ys = np.array([part_stats[k][mkey]["pooled"]["mean"] for k, _ in skew_parts])
+        cis = np.array([part_stats[k][mkey]["pooled"]["ci95"] for k, _ in skew_parts])
+        # Clip error bars to valid [0, 1] AUC-PR domain
+        yerr_lo = np.minimum(cis, ys)
+        yerr_hi = np.minimum(cis, 1.0 - ys)
+        ax2.errorbar(
+            x_skew + dx, ys, yerr=[yerr_lo, yerr_hi], label=lbl, color=col,
+            linestyle=ls, marker=mk, markersize=5.8, linewidth=lw,
+            capsize=3.0, elinewidth=1.05, markeredgecolor="#222222", markeredgewidth=0.5,
+            zorder=4 if "Proposed" in lbl else 3,
+        )
+        if has_profile:
+            pk = _PROFILE_PARTITION[0]
+            py = part_stats[pk][mkey]["pooled"]["mean"]
+            pci = part_stats[pk][mkey]["pooled"]["ci95"]
+            ax2.errorbar(
+                prof_x + dodges_prof_b[idx], py,
+                yerr=[[min(pci, py)], [min(pci, 1.0 - py)]],
+                color=col, linestyle="none", marker=mk, markersize=6.2,
+                capsize=3.2, elinewidth=1.15, markeredgecolor="#222222", markeredgewidth=0.55,
+                zorder=4 if "Proposed" in lbl else 3,
+            )
+
+    # Callout 1: Simpson's Paradox on Local-Only at Dir(0.5) & Dir(0.1)
+    if "dirichlet_a0p1" in part_stats:
+        lo_p01 = part_stats["dirichlet_a0p1"]["local_only:ensemble"]["pooled"]["mean"]
+        lo_m01 = part_stats["dirichlet_a0p1"]["local_only:ensemble"]["macro"]["mean"]
+        ax2.annotate(
+            f"Simpson's Paradox (Local-Only):\n{lo_p01:.3f} Pooled AP via silo base-rate\nmemorization (vs. {lo_m01:.3f} Macro AP)",
+            xy=(3.0 + dodges_skew_b[1] - 0.04, lo_p01),
+            xytext=(0.95, 0.905),
+            ha="center", va="center", fontsize=7.6, color="#333333", fontweight="bold",
+            arrowprops=dict(arrowstyle="->", color=PALETTE["local_only"], lw=1.2, connectionstyle="arc3,rad=-0.10"),
+            bbox=dict(boxstyle="round,pad=0.25", fc="white", ec=PALETTE["local_only"], alpha=0.95),
+            zorder=6,
+        )
+
+    # Callout 2: Baseline FL degradation vs Proposed resilience
+    if "equal" in part_stats and "dirichlet_a0p1" in part_stats:
+        b_eq = part_stats["equal"]["baseline:weighted_voting"]["pooled"]["mean"]
+        b_01 = part_stats["dirichlet_a0p1"]["baseline:weighted_voting"]["pooled"]["mean"]
+        pct_drop = 100.0 * (b_eq - b_01) / b_eq
+        ax2.annotate(
+            f"Baseline FL degrades\n{b_eq:.3f} → {b_01:.3f} (−{pct_drop:.0f}%)",
+            xy=(3.0 + dodges_skew_b[2] - 0.02, b_01 - 0.015),
+            xytext=(1.35, 0.27),
+            ha="center", va="center", fontsize=7.6, color=PALETTE["baseline"], fontweight="bold",
+            arrowprops=dict(arrowstyle="->", color=PALETTE["baseline"], lw=1.2, connectionstyle="arc3,rad=0.14"),
+            bbox=dict(boxstyle="round,pad=0.24", fc="white", ec=PALETTE["baseline"], alpha=0.95),
+            zorder=6,
+        )
+
+    # Callout 3: Proposed beats Baseline across all 5 partitions (Profile anchor)
+    if has_profile:
+        unif_pp = part_stats["profile"]["normalized_fedbn:weighted_calibrated_bayes_1pct"]["pooled"]["mean"]
+        base_pp = part_stats["profile"]["baseline:weighted_voting"]["pooled"]["mean"]
+        ax2.annotate(
+            f"Proposed: {unif_pp:.3f}\nvs. Baseline: {base_pp:.3f}",
+            xy=(prof_x + dodges_prof_b[3], unif_pp - 0.02),
+            xytext=(prof_x - 0.02, 0.365),
+            ha="center", va="center", fontsize=7.4, color=PALETTE["norm_fedbn"], fontweight="bold",
+            arrowprops=dict(arrowstyle="->", color=PALETTE["norm_fedbn"], lw=1.15, connectionstyle="arc3,rad=0.18"),
+            bbox=dict(boxstyle="round,pad=0.22", fc="white", ec=PALETTE["norm_fedbn"], alpha=0.95),
+            zorder=6,
+        )
+
+    ax2.set_xticks(tick_pos)
+    ax2.set_xticklabels(tick_lbls)
+    ax2.set_xlim(-0.44, (prof_x + 0.62) if has_profile else (len(skew_parts) - 0.5))
+    ax2.set_ylim(0.11, 1.07)
+    ax2.set_ylabel("Out-of-Time Pooled Test AUC-PR")
+    ax2.set_title("(b) Pooled Test AUC-PR (Exposing Label-Skew Confounding)")
+
+    # Shared legend across the top
+    handles, labels = ax2.get_legend_handles_labels()
+    fig.legend(
+        handles, labels, loc="upper center", ncol=len(method_specs),
+        bbox_to_anchor=(0.5, 1.03), frameon=True, fontsize=8.1,
+    )
+    fig.suptitle(
+        "RQ1: Non-IID Skew Degradation Across Five Partition Regimes (K = 10 Silos, 5 Seeds, Mean ± 95% CI)",
+        y=1.10, fontsize=11.0, fontweight="bold",
+    )
+    fig.tight_layout()
+    _save(fig, fig_dir, "fig6_skew_degradation")
+    return [
+        os.path.join(fig_dir, "fig6_skew_degradation.png"),
+        os.path.join(fig_dir, "fig6_skew_degradation.pdf"),
+    ]
+
+
 def generate_all_figures(suite_dir: str, out_dir: str | None = None) -> list[str]:
     _apply_pub_style()
     data = load_suite_by_condition(suite_dir)
     if not data:
+        # Auto-fallback to multi-partition suite root if partition subdirs exist
+        parts = _discover_partitions(suite_dir)
+        if parts:
+            return plot_skew_degradation(suite_dir, out_dir)
         raise SystemExit(f"No <condition>/seed_*/results.json found under {suite_dir}")
     fig_dir = out_dir or os.path.join(suite_dir, "figures")
     os.makedirs(fig_dir, exist_ok=True)
@@ -607,7 +947,10 @@ def generate_all_figures(suite_dir: str, out_dir: str | None = None) -> list[str
 
 def main():
     ap = argparse.ArgumentParser(description="Generate publication figures from a multi-seed FL suite")
-    ap.add_argument("--suite-dir", required=True, help="Directory containing <condition>/seed_<N>/results.json")
+    ap.add_argument(
+        "--suite-dir", required=True,
+        help="Single-partition dir (<cond>/seed_<N>/results.json) or multi-partition suite root",
+    )
     ap.add_argument("--out", default=None, help="Output directory (defaults to <suite-dir>/figures)")
     args = ap.parse_args()
     files = generate_all_figures(args.suite_dir, args.out)

@@ -56,10 +56,36 @@ def _load_or_cache_parquet(default_cache: str, source_paths: list[str],
     return df
 
 
+def _downcast_indofraud(tx: pd.DataFrame) -> pd.DataFrame:
+    """Losslessly downcast small integer/float columns in IndoFraud-Synth to cut RAM ~4x."""
+    i8_cols = [
+        "rail", "hour", "dow", "is_payday", "is_promo", "is_night",
+        "device_change", "new_payee", "region_mismatch", "merchant_cat",
+        "is_fraud", "silo_id",
+    ]
+    i32_cols = [
+        "txn_id", "customer_id", "payee_id", "merchant_id", "tenure_days",
+        "velocity_1h", "velocity_24h", "payee_indegree_24h", "merchant_velocity_24h",
+        "campaign_id",
+    ]
+    f32_cols = ["gap_prev_sec", "amount_z", "merchant_vel_z"]
+    for c in i8_cols:
+        if c in tx.columns and tx[c].dtype != np.int8:
+            tx[c] = tx[c].astype(np.int8)
+    for c in i32_cols:
+        if c in tx.columns and tx[c].dtype != np.int32:
+            tx[c] = tx[c].astype(np.int32)
+    for c in f32_cols:
+        if c in tx.columns and tx[c].dtype != np.float32:
+            tx[c] = tx[c].astype(np.float32)
+    return tx
+
+
 def load_indofraud(data_dir: str) -> pd.DataFrame:
     csv_path = os.path.join(data_dir, "transactions.csv.gz")
     pq_path = os.path.join(data_dir, "transactions.parquet")
-    tx = _load_or_cache_parquet(pq_path, [csv_path], lambda: pd.read_csv(csv_path))
+    tx = _load_or_cache_parquet(pq_path, [csv_path], lambda: _downcast_indofraud(pd.read_csv(csv_path)))
+    tx = _downcast_indofraud(tx)
     with open(os.path.join(data_dir, "meta.json")) as f:
         meta = json.load(f)
     tx.attrs["rail_names"] = meta["rail_names"]

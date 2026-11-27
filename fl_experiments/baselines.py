@@ -8,6 +8,7 @@ from sklearn.metrics import f1_score
 from . import models as M
 from .ensemble import (
     fit_calibrators, search_weights, combine_scores_logit, fit_global_post_calibrator,
+    safe_cal_predict,
 )
 from .features import build_matrix, MLPPreprocessor
 from .metrics import (
@@ -92,7 +93,8 @@ def _rules_scores(df: pd.DataFrame) -> np.ndarray:
 
 def run_baselines(pooled, clients, model_types, dataset="indofraud",
                   cent_iters=300, cent_epochs=6, local_t0=120, c_fp=7500.0, seed=42,
-                  tree_patience=80, mlp_patience=3, clients_df=None):
+                  tree_patience=80, mlp_patience=3, clients_df=None,
+                  release_pooled: bool = False):
     Xtr = _prep(pooled["train"], dataset)
     Xva = _prep(pooled["val"], dataset)
     Xte = _prep(pooled["test"], dataset)
@@ -136,9 +138,10 @@ def run_baselines(pooled, clients, model_types, dataset="indofraud",
         )
 
     # Pooled DataFrames are no longer needed once Xtr/Xva/Xte and rules are built;
-    # release them before XGBoost/CatBoost/MLP allocate large training buffers.
+    # release them before XGBoost/CatBoost/MLP allocate large training buffers
+    # when the caller opts in (avoid mutating caller-owned dicts unexpectedly).
     import gc
-    if isinstance(pooled, dict):
+    if release_pooled and isinstance(pooled, dict):
         pooled.clear()
     gc.collect()
 
@@ -316,28 +319,23 @@ def run_baselines(pooled, clients, model_types, dataset="indofraud",
         )
         ens_va_raw = combine_scores_logit(cal_val_oof, cal_w, silos=["pooled"])
         cal_te_by_m = {
-            m: {"pooled": (cals[m]["pooled"].predict(cent_test_scores[m])
-                           if cals[m]["pooled"] is not None else cent_test_scores[m])}
+            m: {"pooled": safe_cal_predict(cals[m]["pooled"], cent_test_scores[m])}
             for m in models_present
         }
         ens_te_raw = combine_scores_logit(cal_te_by_m, cal_w, silos=["pooled"])["pooled"]
         post_c, ens_va_oof = fit_global_post_calibrator(ens_va_raw, {"pooled": yva}, seed=seed)
         ens_va = ens_va_oof["pooled"]
-        ens_te = post_c.predict(ens_te_raw) if post_c is not None else ens_te_raw
+        ens_te = safe_cal_predict(post_c, ens_te_raw)
         ens_silo = None
         if all(m in cent_silo_scores for m in models_present):
             silo_list = list(cent_silo_scores[models_present[0]].keys())
             cal_silo_by_m = {
-                m: {nm: (cals[m]["pooled"].predict(cent_silo_scores[m][nm])
-                         if cals[m]["pooled"] is not None else cent_silo_scores[m][nm])
+                m: {nm: safe_cal_predict(cals[m]["pooled"], cent_silo_scores[m][nm])
                     for nm in silo_list}
                 for m in models_present
             }
             ens_silo_raw = combine_scores_logit(cal_silo_by_m, cal_w, silos=silo_list)
-            ens_silo = (
-                {nm: post_c.predict(ens_silo_raw[nm]) for nm in silo_list}
-                if post_c is not None else ens_silo_raw
-            )
+            ens_silo = {nm: safe_cal_predict(post_c, ens_silo_raw[nm]) for nm in silo_list}
         ens_metrics = _eval_scores(
             yte, ens_te, ate, yva, ens_va, ava, c_fp,
             y_by_silo=(silo_yte if ens_silo is not None else None),
@@ -364,14 +362,13 @@ def run_baselines(pooled, clients, model_types, dataset="indofraud",
             loc_weights[s] = w_s
             ens_va_raw_s = combine_scores_logit(oof_s, w_s, silos=[s])
             cal_te_s = {
-                m: {s: (cals_s[m][s].predict(local_test_scores[m][s])
-                        if cals_s[m][s] is not None else local_test_scores[m][s])}
+                m: {s: safe_cal_predict(cals_s[m][s], local_test_scores[m][s])}
                 for m in loc_models
             }
             ens_te_raw_s = combine_scores_logit(cal_te_s, w_s, silos=[s])[s]
             post_s, ens_va_oof_s = fit_global_post_calibrator(ens_va_raw_s, yv_s, seed=seed + s_idx)
             ens_va_s = ens_va_oof_s[s]
-            ens_te_s = post_s.predict(ens_te_raw_s) if post_s is not None else ens_te_raw_s
+            ens_te_s = safe_cal_predict(post_s, ens_te_raw_s)
             thr_s, _ = cost_threshold(local_val_y[s], ens_va_s, local_val_amt[s], c_fp)
             fl_s = (ens_te_s >= thr_s).astype(int)
             tot_cost_le += fraud_cost(local_test_y[s], ens_te_s, thr_s, local_test_amt[s], c_fp)

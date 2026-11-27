@@ -606,7 +606,7 @@ def main():
             pooled, cores_by_mt, model_types, dataset=args.dataset,
             cent_iters=args.cent_iters, cent_epochs=args.cent_epochs,
             local_t0=args.t0, c_fp=args.c_fp, seed=args.seed,
-            clients_df=clients_df)
+            clients_df=clients_df, release_pooled=True)
         pooled = None
         gc.collect()
 

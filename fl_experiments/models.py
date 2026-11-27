@@ -188,6 +188,11 @@ def train_cat(X, y, iterations, init_model_path=None, seed=42,
               eval_set=None, early_stopping_rounds=None, baseline=None):
     from catboost import CatBoostClassifier, Pool
     kw = cat_params(iterations, seed)
+    # Extreme Dirichlet(0.1) skew can leave tiny clients (e.g., n=2..10); disable
+    # Bernoulli subsampling there so CatBoost does not fail with "Too few sampling units".
+    if len(y) < 20:
+        kw["bootstrap_type"] = "No"
+        kw.pop("subsample", None)
     use_es = False
     if eval_set is not None and early_stopping_rounds:
         Xva, yva = eval_set

@@ -75,14 +75,14 @@ def profile_partition(df: pd.DataFrame, k: int, seed: int = 42) -> dict:
         keep = list(sizes.index[: k - 1])
         parts = {}
         for s in keep:
-            parts[names[s]] = df[df.silo_id == s].copy()
+            parts[names[s]] = df[df.silo_id == s]
         rest = df[~df.silo_id.isin(keep)]
         if len(rest):
-            parts["silo_other"] = rest.copy()
+            parts["silo_other"] = rest
         return parts
 
     # k >= n_raw: keep every institution cleanly named, then split largest silos if k > n_raw
-    parts = {names[s]: df[df.silo_id == s].copy() for s in sizes.index}
+    parts = {names[s]: df[df.silo_id == s] for s in sizes.index}
     if k == n_raw:
         return parts
 
@@ -108,7 +108,7 @@ def profile_partition(df: pd.DataFrame, k: int, seed: int = 42) -> dict:
         for b in range(m):
             chunk = sub[buckets == b]
             if len(chunk):
-                out[f"{nm}_b{b + 1}"] = chunk.copy()
+                out[f"{nm}_b{b + 1}"] = chunk
     return out
 
 
@@ -117,7 +117,7 @@ def equal_partition(df: pd.DataFrame, k: int, seed: int = 42) -> dict:
     idx = rng.permutation(len(df))
     parts = {}
     for i, chunk in enumerate(np.array_split(idx, k)):
-        parts[f"client_{i}"] = df.iloc[np.sort(chunk)].copy()
+        parts[f"client_{i}"] = df.iloc[np.sort(chunk)]
     return parts
 
 
@@ -165,7 +165,7 @@ def dirichlet_partition(df: pd.DataFrame, k: int, alpha: float, seed: int = 42,
             break
 
     return {
-        name: df.iloc[arr].copy()
+        name: df.iloc[arr]
         for name, arr in best_parts.items() if len(arr) > 0
     }
 

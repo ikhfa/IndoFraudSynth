@@ -104,6 +104,14 @@ def _build_calibrator(kind: str):
     return None
 
 
+def safe_cal_predict(cal, scores) -> np.ndarray:
+    """Predict calibrated probabilities safely, handling `cal=None` and 0-row silos."""
+    arr = np.asarray(scores, dtype=np.float64)
+    if cal is None or len(arr) == 0:
+        return arr
+    return np.asarray(cal.predict(arr), dtype=np.float64)
+
+
 def _agg_platt_params(platt_params: dict[str, tuple[float, float, int]],
                       exclude: str | None = None) -> tuple[float, float] | None:
     """FL-safe positive-count-weighted average of local Platt (slope, intercept) scalars."""
@@ -461,17 +469,12 @@ def evaluate_ensemble(clients, payloads, c_fp=7500.0, seed=42, n_draws=300,
 
     cal_val_raw = combine_scores_logit(cal_val_oof, cal_weights, silos=silo_list)
     cal_test_by_m = {
-        m: {s: (cals[m][s].predict(test_scores[m][s])
-                if cals[m][s] is not None else test_scores[m][s])
-            for s in silo_list}
+        m: {s: safe_cal_predict(cals[m][s], test_scores[m][s]) for s in silo_list}
         for m in models
     }
     cal_test_raw = combine_scores_logit(cal_test_by_m, cal_weights, silos=silo_list)
     post_cal, cal_val = fit_global_post_calibrator(cal_val_raw, y_vals, seed=seed)
-    cal_test = (
-        {s: post_cal.predict(cal_test_raw[s]) for s in silo_list}
-        if post_cal is not None else cal_test_raw
-    )
+    cal_test = {s: safe_cal_predict(post_cal, cal_test_raw[s]) for s in silo_list}
     if out_plot_scores is not None:
         out_plot_scores["weighted"] = w_test
         out_plot_scores["calibrated"] = cal_test
@@ -535,10 +538,7 @@ def evaluate_ensemble(clients, payloads, c_fp=7500.0, seed=42, n_draws=300,
                 {m: cal_test_by_m[m] for m in pair}, sub_w, silos=silo_list
             )
             sub_post, sub_val = fit_global_post_calibrator(sub_val_raw, y_vals, seed=seed)
-            sub_test = (
-                {s: sub_post.predict(sub_test_raw[s]) for s in silo_list}
-                if sub_post is not None else sub_test_raw
-            )
+            sub_test = {s: safe_cal_predict(sub_post, sub_test_raw[s]) for s in silo_list}
             sub_thr = _per_silo_thresholds(sub_val)
             key = "+".join(pair)
             ablations_2model[key] = {
