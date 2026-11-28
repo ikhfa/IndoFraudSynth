@@ -206,10 +206,16 @@ class FraudClient:
                 # Train delta trees directly on the global model's raw margin baseline:
                 # mathematically identical to init_model + extract_cat_delta, faster,
                 # and avoids passing unioned multi-silo float borders back into CatBoost.
+                # Use single-step Newton leaf estimation (`leaf_estimation_iterations=1`,
+                # matching XGBoost's 2nd-order step) during Round 2+ continuation so
+                # local skewed residuals do not over-step the converged global margin.
                 g_cat = loaded_global if loaded_global is not None else M.bytes_to_cat(payload)
                 base_margin = M.cat_predict_raw_loaded(g_cat, self.X["train"])
-                model = M.train_cat(self.X["train"], y_tr, round_iters,
-                                    baseline=base_margin, seed=cfg.seed + server_round)
+                model = M.train_cat(
+                    self.X["train"], y_tr, round_iters,
+                    baseline=base_margin, seed=cfg.seed + server_round,
+                    leaf_estimation_iterations=1,
+                )
                 out = M.cat_to_bytes(model)
             elif init_model_path is not None and os.path.exists(init_model_path):
                 model = M.train_cat(self.X["train"], y_tr, round_iters,

@@ -198,3 +198,50 @@ def test_logit_blend_and_post_global_platt_calibration():
         assert np.isfinite(oof_map[s]).all()
         assert (oof_map[s] >= 0.0).all() and (oof_map[s] <= 1.0).all()
 
+
+def test_extreme_dirichlet_platt_prior_shift_prevents_ece_collapse():
+    """Regression test: under extreme Dirichlet(0.1) label skew, a positive-dominated
+    silo (e.g., 1000 pos / 5 neg) must NOT hijack the federated global Platt fallback
+    and push zero-fraud silos to p -> 1.0 (which previously caused ECE ~ 0.96)."""
+    from scipy.special import expit
+    from fl_experiments.ensemble import fit_global_post_calibrator, safe_cal_predict
+
+    rng = np.random.default_rng(3)
+
+    def _mk(n_neg, n_pos, shift=-14.0):
+        y = np.array([0] * n_neg + [1] * n_pos, dtype=np.int8)
+        z = np.where(y == 1, rng.normal(shift + 2.0, 1.5, len(y)), rng.normal(shift, 1.5, len(y)))
+        return expit(z), y
+
+    s0, y0 = _mk(2000, 15)
+    s1, y1 = _mk(50_000, 8)
+    s4, y4 = _mk(5, 1000)      # extreme 99.5% fraud silo
+    s6, y6 = _mk(100_000, 0)   # giant 0% fraud silo -> gets platt_global
+    sc_val = {"c0": s0, "c1": s1, "c4": s4, "c6": s6}
+    yv = {"c0": y0, "c1": y1, "c4": y4, "c6": y6}
+
+    cals, methods, _ = fit_calibrators({"m": sc_val}, yv, seed=42)
+    assert methods["m"]["c6"] == "platt_global"
+    p_map = {k: safe_cal_predict(cals["m"][k], sc_val[k]) for k in sc_val}
+    post, _ = fit_global_post_calibrator(p_map, yv, seed=42)
+    p_post = {k: safe_cal_predict(post, p_map[k]) for k in sc_val}
+
+    p_all = np.concatenate([p_post[k] for k in sc_val])
+    y_all = np.concatenate([yv[k] for k in sc_val])
+    assert p_post["c6"].mean() < 0.02, f"Zero-fraud silo pushed too high: {p_post['c6'].mean()}"
+    assert ece(y_all, p_all) < 0.02, f"Extreme Dirichlet ECE collapsed: {ece(y_all, p_all)}"
+    assert ap(y_all, p_all) > 0.90, f"Extreme Dirichlet pooled AP collapsed: {ap(y_all, p_all)}"
+
+    # Verify _eval_variant clearly separates per-silo vs pooled 1%-capped Bayes savings
+    from types import SimpleNamespace
+    from fl_experiments.ensemble import _eval_variant
+    fake_clients = {
+        k: SimpleNamespace(y={"test": yv[k]}, amt={"test": np.full(len(yv[k]), 500_000.0)})
+        for k in sc_val
+    }
+    ev = _eval_variant(p_post, fake_clients, None, c_fp=7500.0, use_bayes=True, max_alert_rate=0.01)
+    assert "per_silo_bayes_savings_at_1pct" in ev
+    assert np.isclose(ev["savings"], ev["per_silo_bayes_savings_at_1pct"], atol=1e-9)
+    # Pooled 1% cap covers all frauds in 99.5%-fraud silo c4, while per-silo 1% cap truncates c4
+    assert ev["bayes_savings_at_1pct"] > ev["per_silo_bayes_savings_at_1pct"] + 0.5
+

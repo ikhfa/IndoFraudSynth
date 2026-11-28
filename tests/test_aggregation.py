@@ -572,3 +572,12 @@ def test_catboost_plain_params_and_baseline_continuation_equivalence(data):
     assert np.corrcoef(r_init, r_pool)[0, 1] > 0.999
     assert float(np.mean(np.abs(r_init - r_pool))) < 0.01
 
+    # Single-step Newton continuation (`leaf_estimation_iterations=1`) produces smaller,
+    # smoother residual steps for Round 2+ FL CatBoost updates without altering Round 1 defaults.
+    d1_lei1 = M.cat_to_bytes(
+        M.train_cat(X[:300], y[:300], 6, baseline=b1, seed=3, leaf_estimation_iterations=1)
+    )
+    assert tree_count("catboost", d1_lei1) == 6
+    m_lei1 = M.bytes_to_cat(d1_lei1)
+    assert int(m_lei1.get_param("leaf_estimation_iterations")) == 1
+

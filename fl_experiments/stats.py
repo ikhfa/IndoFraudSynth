@@ -494,6 +494,11 @@ def render_markdown(report: dict) -> str:
             f"{_fmt_ci(row.get('bayes_savings_at_1pct'), 3)} | {_fmt_ci(row['ece'], 4)} | "
             f"{_fmt_ci(row['comm_mb'], 2)} |"
         )
+    lines += [
+        "",
+        "> _Note: `Savings` evaluates each variant's deployed decision rule (per-silo 1% alert cap for `*_bayes_1pct`), "
+        "whereas `Bayes@1%` evaluates a pooled 1% global alert cap across all test transactions._",
+    ]
 
     st = report.get("statistics", {})
     if st:

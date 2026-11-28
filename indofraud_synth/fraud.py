@@ -13,7 +13,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .config import SynthConfig
+from .config import SynthConfig, HOUR_WEIGHTS
 
 RAIL_NAMES_DEFAULT = ["QRIS", "EWALLET", "BIFAST", "VA", "CARD"]
 
@@ -73,6 +73,9 @@ def inject_fraud(cfg: SynthConfig, rng: np.random.Generator, legit: pd.DataFrame
     cid = 0
 
     horizon_end = start_epoch + horizon_sec
+    hour_p = np.asarray(HOUR_WEIGHTS, dtype=np.float64)
+    hour_p = hour_p / hour_p.sum()
+    hour_rng = np.random.default_rng(int(cfg.seed) + 2027)
 
     def day_meta(ts):
         day_idx = np.clip(((ts - start_epoch) // 86400).astype(int),
@@ -82,10 +85,16 @@ def inject_fraud(cfg: SynthConfig, rng: np.random.Generator, legit: pd.DataFrame
     def rand_ts(k, night_bias=0.0, tail_margin_sec: int = 7200):
         # Leave a campaign-duration buffer before horizon_end so multi-leg
         # campaigns do not clamp and pile up on the final second of test.
+        # Sample diurnal hours from HOUR_WEIGHTS (dedicated stream preserves
+        # campaign day placement) so daytime typologies (APP, QRIS_ABUSE) are
+        # not artificially overrepresented at night vs legit traffic.
         max_margin = max(horizon_sec // 5, 1)
         margin = min(max(int(tail_margin_sec), 1), max_margin)
         hi = max(horizon_sec - margin, 1)
-        t = start_epoch + rng.integers(0, hi, k)
+        day_off = (rng.integers(0, hi, k) // 86400) * 86400
+        h = hour_rng.choice(24, k, p=hour_p)
+        t = start_epoch + day_off + h * 3600 + hour_rng.integers(0, 3600, k)
+        t = np.clip(t, start_epoch, start_epoch + hi - 1)
         if night_bias > 0:
             night = rng.random(k) < night_bias
             # shift into 00:00-05:00 of the same day (clipped inside horizon)
@@ -175,6 +184,7 @@ def inject_fraud(cfg: SynthConfig, rng: np.random.Generator, legit: pd.DataFrame
                     base_amt = max(means[rail] * 4.5, 300_000) * amt_d
                     amt = np.clip(np.exp(rng.normal(np.log(base_amt), 0.85, legs)),
                                   50_000, caps[rail])
+                    amt = np.clip(np.round(amt / 1000) * 1000, 50_000, caps[rail])
                     for p, t_leg, a in zip(payees, ts, amt):
                         received[int(p)].append((int(t_leg), int(a)))
                     dow, pd_, pr = day_meta(ts)
@@ -201,12 +211,15 @@ def inject_fraud(cfg: SynthConfig, rng: np.random.Generator, legit: pd.DataFrame
                     victim = int(rng.integers(0, n))
                     t0 = int(rand_ts(1, tail_margin_sec=4 * 86400)[0])
                     amt_d, gap_d = drift_scale(t0)
+                    # Urgency gaps (5–45 min) keep multi-leg social-engineering transfers
+                    # within waking diurnal hours instead of spilling evening starts past midnight.
                     ts = bounded_leg_ts(
-                        t0, np.sort(rng.integers(300, int(86400 * gap_d), legs)).cumsum(),
+                        t0, np.sort(rng.integers(300, int(2700 * gap_d), legs)).cumsum(),
                     )
                     base_amt = max(means[rail] * 3.5, 250_000) * amt_d
                     amt = np.clip(np.exp(rng.normal(np.log(base_amt), 0.95, legs)),
                                   50_000, min(50_000_000, caps[rail]))
+                    amt = np.clip(np.round(amt / 1000) * 1000, 50_000, min(50_000_000, caps[rail]))
                     dow, pd_, pr = day_meta(ts)
                     # On merchant rails (VA, CARD), APP scams route through shell/marketplace
                     # merchants rather than merchant_id=-1 (avoiding a deterministic leak).
@@ -269,6 +282,7 @@ def inject_fraud(cfg: SynthConfig, rng: np.random.Generator, legit: pd.DataFrame
                     total = total_in * 0.95
                     split = rng.dirichlet(np.ones(legs)) * total
                     amt = np.clip(split, 50_000, caps[rail])
+                    amt = np.clip(np.round(amt / 1000) * 1000, 50_000, caps[rail])
                     payees = rng.choice(agg_ids, legs)
                     received[mule] = remaining
                     dow, pd_, pr = day_meta(ts)
@@ -299,9 +313,13 @@ def inject_fraud(cfg: SynthConfig, rng: np.random.Generator, legit: pd.DataFrame
                             legs = max(need, 12)
                     t0 = int(rand_ts(1, tail_margin_sec=3 * 86400)[0])
                     amt_d, gap_d = drift_scale(t0)
-                    ts = bounded_leg_ts(
-                        t0, np.sort(rng.integers(0, int(2 * 86400 * gap_d), legs)),
-                    )
+                    # Victims scan tampered static QR during merchant's diurnal hours over 1-2 days
+                    base_day = ((t0 - start_epoch) // 86400) * 86400 + start_epoch
+                    span_days = max(int(round(2 * gap_d)), 2)
+                    leg_days = rng.integers(0, span_days, legs)
+                    leg_hours = hour_rng.choice(24, legs, p=hour_p)
+                    raw_ts = np.sort(base_day + leg_days * 86400 + leg_hours * 3600 + hour_rng.integers(0, 3600, legs))
+                    ts = bounded_leg_ts(int(raw_ts[0]), raw_ts - int(raw_ts[0]))
                     payers = rng.choice(n, legs, replace=False) if legs <= n else rng.choice(n, legs)
                     amt = np.round(rng.uniform(10_000, 120_000 * amt_d, legs) / 500) * 500
                     amt = np.maximum(amt, 5_000)

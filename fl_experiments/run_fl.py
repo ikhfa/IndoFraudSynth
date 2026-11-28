@@ -379,7 +379,7 @@ def _model_cache_key(args, mt: str, budget: int | None, eff_device: str,
     """Deterministic SHA-256 key capturing every parameter that affects a model's FL weights."""
     silo_sig = [(name, len(fr["train"]), len(fr["val"])) for name, fr in clients_df.items()]
     spec = {
-        "v": 2,
+        "v": 3,
         "dataset": args.dataset,
         "data": os.path.basename(os.path.normpath(args.data)),
         "partition": args.partition,

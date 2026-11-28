@@ -206,6 +206,22 @@ def test_v1_behavioral_realism_invariants():
             f"MULE fan-out skewed into val/test tail: train={mule_tr}/{mule_tot}"
         )
 
+    # 7. No amount-rounding shortcut: every transaction matches rail currency step (500 QRIS, 1000 other)
+    qris_mask = tx.rail == ridx["QRIS"]
+    assert (tx.loc[qris_mask, "amount"] % 500 == 0).all(), "QRIS amount rounding mismatch"
+    assert (tx.loc[~qris_mask, "amount"] % 1000 == 0).all(), "Non-QRIS amount rounding mismatch"
+
+    # 8. Diurnal hour realism: daytime typologies (QRIS_ABUSE, APP) are not uniform-24h night-heavy
+    qris_ab = tx[tx.typology == "QRIS_ABUSE"]
+    app_tx = tx[tx.typology == "APP"]
+    ato_tx = tx[tx.typology == "ATO"]
+    if len(qris_ab) >= 20:
+        assert qris_ab.is_night.mean() < 0.15, f"QRIS_ABUSE night rate too high: {qris_ab.is_night.mean():.3f}"
+    if len(app_tx) >= 20:
+        assert app_tx.is_night.mean() < 0.20, f"APP night rate too high: {app_tx.is_night.mean():.3f}"
+    if len(ato_tx) >= 20:
+        assert ato_tx.is_night.mean() > 0.25, f"ATO should retain elevated night bias: {ato_tx.is_night.mean():.3f}"
+
 
 def test_proportional_train_cap_preserves_skew_and_config_deepcopy(tiny, tmp_path):
     """Regression tests:

@@ -32,8 +32,9 @@ class PlattCalibrator:
     so severely under-scaled unnormalized GBDT probabilities retain their ranking.
     """
 
-    def __init__(self, reg: float = 0.1):
+    def __init__(self, reg: float = 0.1, slope_bounds: tuple[float, float] = (1e-3, 50.0)):
         self.reg = float(reg)
+        self.slope_bounds = (float(slope_bounds[0]), float(slope_bounds[1]))
         self.slope_: float = 1.0
         self.intercept_: float = 0.0
 
@@ -71,7 +72,7 @@ class PlattCalibrator:
             x0=np.array([1.0, 0.0], dtype=np.float64),
             jac=True,
             method="L-BFGS-B",
-            bounds=[(1e-3, 50.0), (-50.0, 50.0)],
+            bounds=[self.slope_bounds, (-50.0, 50.0)],
             options={"maxiter": 200},
         )
         self.slope_ = float(res.x[0])
@@ -112,29 +113,85 @@ def safe_cal_predict(cal, scores) -> np.ndarray:
     return np.asarray(cal.predict(arr), dtype=np.float64)
 
 
-def _agg_platt_params(platt_params: dict[str, tuple[float, float, int]],
-                      exclude: str | None = None) -> tuple[float, float] | None:
-    """FL-safe positive-count-weighted average of local Platt (slope, intercept) scalars."""
-    items = [(a, b, w) for s, (a, b, w) in platt_params.items() if s != exclude and w > 0]
+def _prior_logit(pos: float, total: float) -> float:
+    p = float(np.clip(float(pos) / max(float(total), 1.0), 1e-6, 1.0 - 1e-6))
+    return float(np.log(p / (1.0 - p)))
+
+
+def _fisher_weight(pos: int, total: int) -> float:
+    """Effective binomial Fisher weight `pos * neg / (pos + neg)`.
+
+    Matches `pos` when `neg >> pos` (typical rare-event silos), while preventing
+    degenerate extreme-Dirichlet silos (e.g., 1,000 pos / 5 neg) from dominating
+    the federated global Platt average.
+    """
+    neg = max(int(total) - int(pos), 0)
+    tot = int(pos) + neg
+    if pos <= 0 or neg <= 0 or tot <= 0:
+        return 0.0
+    return float(pos * neg) / float(tot)
+
+
+def _agg_platt_params(platt_params: dict[str, tuple[float, float, int, int]],
+                      exclude: str | None = None,
+                      silo_counts: dict[str, tuple[int, int]] | None = None,
+                      prior_shift: bool = True) -> tuple[float, float, float] | None:
+    """FL-safe Fisher-weighted, Bayes-prior-adjusted average of local Platt scalars.
+
+    Each silo shares only `(slope, intercept, pos_count, total_count)`.
+    When `prior_shift=True`, local intercepts are neutralized by subtracting each
+    silo's log-odds prior `logit(pi_k)` before averaging and then re-anchored to
+    the federated global prior `logit(pi_global)` — preventing an extreme-Dirichlet
+    positive-heavy silo from shifting zero-fraud silos toward p -> 1.0.
+
+    Returns `(a_global, b_global_at_global_prior, b_neutral)` or `None`.
+    """
+    items = []
+    for s, (a, b, pos, tot) in platt_params.items():
+        if s == exclude:
+            continue
+        w = _fisher_weight(pos, tot)
+        if w > 0.0:
+            items.append((a, b, pos, tot, w))
     if not items:
         return None
-    tot_w = float(sum(w for _, _, w in items))
-    a_g = sum(a * w for a, _, w in items) / tot_w
-    b_g = sum(b * w for _, b, w in items) / tot_w
-    return float(a_g), float(b_g)
+    tot_w = float(sum(w for _, _, _, _, w in items))
+    a_g = sum(a * w for a, _, _, _, w in items) / tot_w
+    if not prior_shift:
+        b_g = sum(b * w for _, b, _, _, w in items) / tot_w
+        return float(a_g), float(b_g), float(b_g)
+
+    b_neutral_g = sum((b - _prior_logit(pos, tot)) * w for _, b, pos, tot, w in items) / tot_w
+    if silo_counts:
+        g_pos = sum(p for s, (p, _) in silo_counts.items() if s != exclude)
+        g_tot = sum(n for s, (_, n) in silo_counts.items() if s != exclude)
+        if g_tot <= 0:
+            g_pos = sum(p for p, _ in silo_counts.values())
+            g_tot = sum(n for _, n in silo_counts.values())
+    else:
+        g_pos = sum(pos for _, _, pos, _, _ in items)
+        g_tot = sum(tot for _, _, _, tot, _ in items)
+    b_global = b_neutral_g + _prior_logit(g_pos, g_tot)
+    return float(a_g), float(b_global), float(b_neutral_g)
 
 
-def _shrink_platt(cal: PlattCalibrator, global_ab: tuple[float, float] | None,
-                  pos: int, prior_strength: float = 15.0) -> PlattCalibrator:
-    """Empirical-Bayes shrinkage of a Platt fit toward federated global (a, b).
-    Weight gamma = pos / (pos + prior_strength) smoothly approaches 1.0 for large silos."""
-    if global_ab is None or pos >= 500:
+def _shrink_platt(cal: PlattCalibrator, global_info: tuple[float, float, float] | None,
+                  pos: int, total: int, prior_strength: float = 15.0) -> PlattCalibrator:
+    """Empirical-Bayes shrinkage of a local Platt fit toward federated global `(a, b_target)`.
+
+    Uses effective Fisher count `eff_n = pos * neg / (pos + neg)` for shrinkage weight
+    `gamma = eff_n / (eff_n + prior_strength)` and shifts the global prior-neutral
+    intercept back to the silo's own local prior `logit(pi_k)`.
+    """
+    eff_n = _fisher_weight(pos, total)
+    if global_info is None or eff_n >= 500.0:
         return cal
-    gamma = float(pos) / (float(pos) + float(prior_strength))
-    a_g, b_g = global_ab
+    gamma = float(eff_n) / (float(eff_n) + float(prior_strength))
+    a_g, _, b_neutral_g = global_info
+    b_target = b_neutral_g + _prior_logit(pos, total)
     return PlattCalibrator.from_params(
         gamma * cal.slope_ + (1.0 - gamma) * a_g,
-        gamma * cal.intercept_ + (1.0 - gamma) * b_g,
+        gamma * cal.intercept_ + (1.0 - gamma) * b_target,
         reg=cal.reg,
     )
 
@@ -204,29 +261,32 @@ def fit_global_post_calibrator(val_scores_by_silo: dict[str, np.ndarray],
     rankings. Returns `(calibrator_or_None, oof_val_scores_by_silo)`.
     """
     silos = list(val_scores_by_silo.keys())
-    local_platt: dict[str, tuple[float, float, int]] = {}
+    local_platt: dict[str, tuple[float, float, int, int]] = {}
     for s in silos:
         y = np.asarray(y_vals[s], dtype=int)
         sc = np.asarray(val_scores_by_silo[s], dtype=np.float64)
         pos = int(y.sum())
-        neg = int(len(y) - pos)
+        tot = int(len(y))
+        neg = tot - pos
         if pos >= 5 and neg >= 5:
-            cal = PlattCalibrator().fit(sc, y)
-            local_platt[s] = (cal.slope_, cal.intercept_, pos)
+            # Inputs are already per-silo calibrated; use regularized bounded slope
+            # so post-blend recalibration adjusts dispersion without blowing up under skew.
+            cal = PlattCalibrator(reg=1.0, slope_bounds=(0.25, 4.0)).fit(sc, y)
+            local_platt[s] = (cal.slope_, cal.intercept_, pos, tot)
 
-    global_ab = _agg_platt_params(local_platt, exclude=None)
+    global_ab = _agg_platt_params(local_platt, exclude=None, prior_shift=False)
     if global_ab is None:
         return None, {s: np.asarray(val_scores_by_silo[s], dtype=np.float64).copy() for s in silos}
 
-    post_cal = PlattCalibrator.from_params(global_ab[0], global_ab[1])
+    post_cal = PlattCalibrator.from_params(global_ab[0], global_ab[1], reg=1.0)
     oof: dict[str, np.ndarray] = {}
     for s in silos:
         sc = np.asarray(val_scores_by_silo[s], dtype=np.float64)
         y = np.asarray(y_vals[s], dtype=int)
         if len(silos) >= 2:
-            other_ab = _agg_platt_params(local_platt, exclude=s)
+            other_ab = _agg_platt_params(local_platt, exclude=s, prior_shift=False)
             if other_ab is not None:
-                oof[s] = PlattCalibrator.from_params(other_ab[0], other_ab[1]).predict(sc)
+                oof[s] = PlattCalibrator.from_params(other_ab[0], other_ab[1], reg=1.0).predict(sc)
             else:
                 oof[s] = post_cal.predict(sc)
         else:
@@ -240,7 +300,7 @@ def fit_global_post_calibrator(val_scores_by_silo: dict[str, np.ndarray],
                     pos_tr = int(y[tr].sum())
                     neg_tr = int(len(y[tr]) - pos_tr)
                     if pos_tr >= 2 and neg_tr >= 2:
-                        pred[va] = PlattCalibrator().fit(sc[tr], y[tr]).predict(sc[va])
+                        pred[va] = PlattCalibrator(reg=1.0, slope_bounds=(0.25, 4.0)).fit(sc[tr], y[tr]).predict(sc[va])
                     else:
                         pred[va] = sc[va]
                 oof[s] = pred
@@ -305,36 +365,46 @@ def fit_calibrators(val_scores, y_vals, seed: int = 42, prior_strength: float = 
     cals, methods, oof = {}, {}, {}
     for m, by_silo in val_scores.items():
         cals[m] = {}; methods[m] = {}; oof[m] = {}
-        # Pass 1: fit local Platt scalars on every silo with >=5 positives to build
-        # the FL-safe global fallback/shrinkage target (2 floats + 1 int per silo).
-        local_platt: dict[str, tuple[float, float, int]] = {}
-        raw_local: dict[str, tuple[object | None, str, np.ndarray, np.ndarray, int]] = {}
+        # Pass 1: fit local Platt scalars on every silo with >=5 pos and >=5 neg to build
+        # the FL-safe Bayes-prior-adjusted global fallback/shrinkage target
+        # (only 2 floats + 2 scalar counts per silo).
+        local_platt: dict[str, tuple[float, float, int, int]] = {}
+        silo_counts: dict[str, tuple[int, int]] = {}
+        raw_local: dict[str, tuple[object | None, str, np.ndarray, np.ndarray, int, int]] = {}
         for s, scores in by_silo.items():
             y = np.asarray(y_vals[s], dtype=int)
             sc = np.asarray(scores, dtype=np.float64)
             pos = int(y.sum())
-            neg = int(len(y) - pos)
+            tot = int(len(y))
+            silo_counts[s] = (pos, tot)
             cal, kind = _make_calibrator(y)
             if cal is not None:
                 cal.fit(sc, y)
                 if kind == "platt":
-                    local_platt[s] = (cal.slope_, cal.intercept_, pos)
+                    local_platt[s] = (cal.slope_, cal.intercept_, pos, tot)
                 else:
                     # Also fit a lightweight 2-param Platt strictly for global fallback sharing
                     p_share = PlattCalibrator().fit(sc, y)
-                    local_platt[s] = (p_share.slope_, p_share.intercept_, pos)
-            raw_local[s] = (cal, kind, sc, y, pos)
+                    local_platt[s] = (p_share.slope_, p_share.intercept_, pos, tot)
+            raw_local[s] = (cal, kind, sc, y, pos, tot)
 
-        global_ab = _agg_platt_params(local_platt, exclude=None) if len(by_silo) >= 2 else None
+        global_info = (
+            _agg_platt_params(local_platt, exclude=None, silo_counts=silo_counts, prior_shift=True)
+            if len(by_silo) >= 2 else None
+        )
 
         # Pass 2: assemble final per-silo calibrators and strictly leak-free OOF predictions
-        for s, (cal, kind, sc, y, pos) in raw_local.items():
-            other_ab = _agg_platt_params(local_platt, exclude=s) if len(by_silo) >= 2 else None
+        for s, (cal, kind, sc, y, pos, tot) in raw_local.items():
+            other_info = (
+                _agg_platt_params(local_platt, exclude=s, silo_counts=silo_counts, prior_shift=True)
+                if len(by_silo) >= 2 else None
+            )
 
             if cal is None:
-                # Low-positive silo (<5 positives): use FL-safe global Platt fallback
-                if global_ab is not None:
-                    gcal = PlattCalibrator.from_params(global_ab[0], global_ab[1])
+                # Low-positive or single-class silo (<5 pos or <5 neg): use FL-safe global Platt
+                # anchored at the federated global prior pi_global.
+                if global_info is not None:
+                    gcal = PlattCalibrator.from_params(global_info[0], global_info[1])
                     cals[m][s] = gcal
                     methods[m][s] = "platt_global"
                     oof[m][s] = gcal.predict(sc)
@@ -344,8 +414,8 @@ def fit_calibrators(val_scores, y_vals, seed: int = 42, prior_strength: float = 
                     oof[m][s] = sc.copy()
                 continue
 
-            if kind == "platt" and other_ab is not None:
-                final_cal = _shrink_platt(cal, other_ab, pos, prior_strength=prior_strength)
+            if kind == "platt" and other_info is not None:
+                final_cal = _shrink_platt(cal, other_info, pos, tot, prior_strength=prior_strength)
                 cals[m][s] = final_cal
                 methods[m][s] = "platt_shrunk"
             else:
@@ -353,24 +423,25 @@ def fit_calibrators(val_scores, y_vals, seed: int = 42, prior_strength: float = 
                 cals[m][s] = final_cal
                 methods[m][s] = kind
 
-            n_splits = min(3, pos, int(len(y) - pos))
+            n_splits = min(3, pos, int(tot - pos))
             if n_splits >= 2:
                 skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
                 pred = np.empty_like(sc, dtype=np.float64)
                 for tr, va in skf.split(sc.reshape(-1, 1), y):
                     pos_tr = int(y[tr].sum())
-                    neg_tr = int(len(y[tr]) - pos_tr)
+                    tot_tr = int(len(y[tr]))
+                    neg_tr = tot_tr - pos_tr
                     # Lock inner OOF calibrator family to outer `kind` (prevents silent
                     # identity fallback when pos in {5,6,7} or family flip at pos in {50..74})
                     if pos_tr >= 2 and neg_tr >= 2:
                         fcal = _build_calibrator(kind)
                         fcal.fit(sc[tr], y[tr])
-                        if kind == "platt" and other_ab is not None:
-                            fcal = _shrink_platt(fcal, other_ab, pos_tr,
+                        if kind == "platt" and other_info is not None:
+                            fcal = _shrink_platt(fcal, other_info, pos_tr, tot_tr,
                                                  prior_strength=prior_strength)
                         pred[va] = fcal.predict(sc[va])
-                    elif other_ab is not None:
-                        pred[va] = PlattCalibrator.from_params(other_ab[0], other_ab[1]).predict(sc[va])
+                    elif other_info is not None:
+                        pred[va] = PlattCalibrator.from_params(other_info[0], other_info[1]).predict(sc[va])
                     else:
                         pred[va] = sc[va]
                 oof[m][s] = pred
@@ -386,10 +457,20 @@ def _eval_variant(test_scores, clients, thr_map, c_fp, use_bayes=False,
     If `use_bayes=True`, applies Bayes minimum-risk decisions `p_i * A_i >= c_fp`
     directly on calibrated probabilities instead of a flat threshold (optionally
     subject to a per-silo `max_alert_rate` operational budget).
+
+    Metric semantics:
+      - `savings` reflects this variant's actual deployed decision rule (`thr_map`
+        or per-silo Bayes rule with `max_alert_rate`, matching independent per-institution
+        SOC alert budgets).
+      - `per_silo_bayes_savings_at_1pct` always reports per-silo 1%-capped Bayes savings.
+      - `bayes_savings_at_1pct` reports pooled 1%-capped Bayes savings across all silos
+        (useful under extreme Dirichlet alpha=0.1 where a single silo may have >80% fraud
+        and a 1% per-silo cap mechanically truncates true positives).
     """
     ys, ss, amts, flags = [], [], [], []
     per_silo_ap = {}
     total_cost, total_loss = 0.0, 0.0
+    per_silo_b1_cost = 0.0
     for s, scores in test_scores.items():
         c = clients[s]
         y = c.y["test"]; amt = c.amt["test"]
@@ -400,6 +481,8 @@ def _eval_variant(test_scores, clients, thr_map, c_fp, use_bayes=False,
             thr = thr_map[s]
             fl = (scores >= thr).astype(int)
             cost = fraud_cost(y, scores, thr, amt, c_fp)
+        fl_b1 = bayes_cost_predict(scores, amt, c_fp=c_fp, max_alert_rate=0.01)
+        per_silo_b1_cost += fraud_cost_flags(y, fl_b1, amt, c_fp)
         ys.append(y); ss.append(scores); amts.append(amt); flags.append(fl)
         a = ap(y, scores)
         if not np.isnan(a):
@@ -417,6 +500,7 @@ def _eval_variant(test_scores, clients, thr_map, c_fp, use_bayes=False,
         "alert_rate": alert_rate(f_all),
         "fpr": fpr_flags(y_all, f_all),
         "savings": float(1 - total_cost / total_loss) if total_loss > 0 else float("nan"),
+        "per_silo_bayes_savings_at_1pct": float(1 - per_silo_b1_cost / total_loss) if total_loss > 0 else float("nan"),
         "bayes_savings": bayes_savings(y_all, s_all, amt_all, c_fp),
         "bayes_alert_rate": alert_rate(b_flags_all),
         "bayes_savings_at_1pct": bayes_savings(y_all, s_all, amt_all, c_fp, max_alert_rate=0.01),

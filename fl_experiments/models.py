@@ -185,9 +185,12 @@ def cat_params(iterations, seed=42):
 
 
 def train_cat(X, y, iterations, init_model_path=None, seed=42,
-              eval_set=None, early_stopping_rounds=None, baseline=None):
+              eval_set=None, early_stopping_rounds=None, baseline=None,
+              leaf_estimation_iterations: int | None = None):
     from catboost import CatBoostClassifier, Pool
     kw = cat_params(iterations, seed)
+    if leaf_estimation_iterations is not None:
+        kw["leaf_estimation_iterations"] = int(leaf_estimation_iterations)
     # Extreme Dirichlet(0.1) skew can leave tiny clients (e.g., n=2..10); disable
     # Bernoulli subsampling there so CatBoost does not fail with "Too few sampling units".
     if len(y) < 20:
